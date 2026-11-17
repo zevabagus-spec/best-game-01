@@ -1,186 +1,236 @@
-// Every sound is synthesized with WebAudio: no audio files, nothing to load.
-// The context is created on the first user gesture (browsers forbid sound
-// before one), so the title screen is silent until the player starts. Music is
-// a slow pentatonic pluck over a soft pad, scheduled a little ahead of time.
+// Every sound is synthesized with WebAudio: no audio files, nothing fetched.
+// Short effects are oscillators and filtered noise; the music is a small
+// generative loop — a slow pad under a pentatonic arpeggio — whose pace and
+// root follow the fight. Nothing starts until a gesture unlocks the context,
+// and every call is a no-op when audio is unavailable or muted.
 
-const PENTATONIC = [220.0, 261.63, 293.66, 329.63, 392.0, 440.0, 523.25];
+const SHOT_GAP = 0.06;
+const KILL_GAP = 0.05;
+const SHARD_GAP = 0.05;
+
+/** A-minor pentatonic arpeggio notes, in Hz, across two octaves. */
+const ARP_NOTES = [220.0, 261.63, 329.63, 392.0, 440.0, 523.25, 659.25, 783.99];
+/** Pad chord roots the loop walks through (Am, F, C, G). */
+const PAD_ROOTS = [110.0, 87.31, 130.81, 98.0];
 
 export function createAudio() {
   let context = null;
   let master = null;
   let musicGain = null;
   let muted = false;
-  let musicNext = 0;
-  let musicStep = 0;
-  let pluckIndex = 0;
+  let unlocked = false;
+  let lastShot = -1;
+  let lastKill = -1;
+  let lastShard = -1;
+  let musicTime = 0;
+  let nextArp = 0;
+  let nextPad = 0;
+  let arpStep = 0;
+  let padStep = 0;
+  let intensity = 'calm';
 
   function ensure() {
-    if (context !== null) return context !== null;
+    if (context !== null) return true;
+    if (typeof window === 'undefined') return false;
+    const AudioContext = window.AudioContext ?? window.webkitAudioContext;
+    if (!AudioContext) return false;
     try {
-      const Ctor = window.AudioContext || window.webkitAudioContext;
-      if (!Ctor) return false;
-      context = new Ctor();
-      master = context.createGain();
-      master.gain.value = 0.5;
-      master.connect(context.destination);
-      musicGain = context.createGain();
-      musicGain.gain.value = 0.16;
-      musicGain.connect(master);
-      return true;
+      context = new AudioContext();
     } catch {
-      context = null;
       return false;
     }
+    master = context.createGain();
+    master.gain.value = muted ? 0 : 0.9;
+    master.connect(context.destination);
+    musicGain = context.createGain();
+    musicGain.gain.value = 0.5;
+    musicGain.connect(master);
+    return true;
   }
 
-  /** Call from a user gesture (click or key) so the browser allows sound. */
-  function unlock() {
-    if (!ensure()) return;
-    if (context.state === 'suspended') context.resume().catch(() => {});
-  }
-
-  function tone(freq, dur, type, volume, when, slideTo) {
-    if (context === null || muted) return;
-    try {
-      const t0 = when ?? context.currentTime;
-      const osc = context.createOscillator();
-      const gain = context.createGain();
-      osc.type = type;
-      osc.frequency.setValueAtTime(freq, t0);
-      if (slideTo !== undefined) osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
-      gain.gain.setValueAtTime(0, t0);
-      gain.gain.linearRampToValueAtTime(volume, t0 + 0.008);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-      osc.connect(gain);
-      gain.connect(master);
-      osc.start(t0);
-      osc.stop(t0 + dur + 0.05);
-    } catch {
-      // Sound is garnish: never let it break the game.
+  function tone({ frequency, endFrequency, type = 'sine', duration, volume, when = 0, slide = true, destination = null }) {
+    if (!ensure() || muted) return;
+    const start = context.currentTime + when;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(frequency, start);
+    if (slide && endFrequency !== undefined) {
+      oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration);
     }
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(volume, start + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    oscillator.connect(gain);
+    gain.connect(destination ?? master);
+    oscillator.start(start);
+    oscillator.stop(start + duration + 0.05);
   }
 
-  function noise(dur, volume, lowpass) {
-    if (context === null || muted) return;
-    try {
-      const t0 = context.currentTime;
-      const length = Math.max(1, Math.floor(context.sampleRate * dur));
-      const buffer = context.createBuffer(1, length, context.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / length);
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      const filter = context.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.value = lowpass;
-      const gain = context.createGain();
-      gain.gain.value = volume;
-      source.connect(filter);
-      filter.connect(gain);
-      gain.connect(master);
-      source.start(t0);
-    } catch {
-      // Sound is garnish: never let it break the game.
+  function noise({ duration, volume, filterFrequency, type = 'lowpass', when = 0, quality = 0.8 }) {
+    if (!ensure() || muted) return;
+    const start = context.currentTime + when;
+    const length = Math.max(1, Math.floor(context.sampleRate * duration));
+    const buffer = context.createBuffer(1, length, context.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let index = 0; index < length; index += 1) {
+      data[index] = (Math.random() * 2 - 1) * (1 - index / length);
     }
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    const filter = context.createBiquadFilter();
+    filter.type = type;
+    filter.frequency.value = filterFrequency;
+    filter.Q.value = quality;
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(volume, start);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(master);
+    source.start(start);
   }
 
-  function note(freq, dur, volume) {
-    if (context === null || muted || musicGain === null) return;
-    try {
-      const t0 = musicNext;
-      const osc = context.createOscillator();
+  function padChord(root) {
+    if (!ensure() || muted) return;
+    const start = context.currentTime + 0.05;
+    for (const ratio of [1, 1.5, 2.02]) {
+      const oscillator = context.createOscillator();
       const gain = context.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0, t0);
-      gain.gain.linearRampToValueAtTime(volume, t0 + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-      osc.connect(gain);
+      oscillator.type = 'triangle';
+      oscillator.frequency.value = root * ratio;
+      oscillator.detune.value = ratio === 1 ? -4 : 4;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.05, start + 1.2);
+      gain.gain.linearRampToValueAtTime(0, start + 4.4);
+      oscillator.connect(gain);
       gain.connect(musicGain);
-      osc.start(t0);
-      osc.stop(t0 + dur + 0.05);
-    } catch {
-      // Sound is garnish: never let it break the game.
+      oscillator.start(start);
+      oscillator.stop(start + 4.6);
     }
+  }
+
+  function arpNote(frequency, volume) {
+    tone({ frequency, type: 'sine', duration: 0.32, volume, destination: musicGain });
+    tone({ frequency: frequency * 2, type: 'sine', duration: 0.18, volume: volume * 0.4, destination: musicGain });
   }
 
   return {
-    unlock,
+    /** Start the context after a user gesture; safe to call often. */
+    unlock() {
+      if (!ensure()) return;
+      unlocked = true;
+      if (context.state === 'suspended') {
+        context.resume().catch(() => {});
+      }
+    },
+    setMuted(value) {
+      muted = value;
+      if (master !== null) master.gain.value = muted ? 0 : 0.9;
+    },
     toggleMute() {
-      muted = !muted;
-      if (master !== null) master.gain.value = muted ? 0 : 0.5;
+      this.setMuted(!muted);
       return muted;
     },
-    get muted() {
+    get isMuted() {
       return muted;
+    },
+    /** Advance the generative loop; `mood` is calm, combat or boss. */
+    music(dt, mood) {
+      if (!unlocked || !ensure() || muted) return;
+      intensity = mood;
+      musicTime += dt;
+      const arpGap = intensity === 'boss' ? 0.19 : intensity === 'combat' ? 0.26 : 0.52;
+      if (musicTime >= nextArp) {
+        nextArp = musicTime + arpGap;
+        const note = ARP_NOTES[arpStep % ARP_NOTES.length];
+        arpStep += intensity === 'boss' ? 3 : 1;
+        arpNote(intensity === 'boss' ? note / 2 : note, intensity === 'calm' ? 0.06 : 0.085);
+      }
+      if (musicTime >= nextPad) {
+        nextPad = musicTime + 4.4;
+        padChord(PAD_ROOTS[padStep % PAD_ROOTS.length]);
+        padStep += 1;
+      }
     },
     shoot() {
-      tone(720, 0.09, 'square', 0.10, undefined, 320);
-    },
-    hit() {
-      noise(0.06, 0.12, 2400);
-    },
-    kill() {
-      tone(520, 0.12, 'triangle', 0.16, undefined, 140);
-      noise(0.08, 0.10, 1800);
-    },
-    shard() {
-      tone(1180, 0.10, 'sine', 0.12, undefined, 1560);
+      if (!unlocked) return;
+      const now = context ? context.currentTime : 0;
+      if (now - lastShot < SHOT_GAP) return;
+      lastShot = now;
+      tone({ frequency: 880, endFrequency: 340, type: 'square', duration: 0.07, volume: 0.05 });
     },
     hurt() {
-      tone(180, 0.25, 'sawtooth', 0.18, undefined, 70);
+      tone({ frequency: 160, endFrequency: 60, type: 'sawtooth', duration: 0.22, volume: 0.16 });
+      noise({ duration: 0.14, volume: 0.1, filterFrequency: 700 });
     },
-    lanternHit() {
-      tone(120, 0.30, 'sine', 0.22, undefined, 55);
-      noise(0.12, 0.10, 700);
+    beaconHit() {
+      tone({ frequency: 220, endFrequency: 110, type: 'triangle', duration: 0.3, volume: 0.16 });
+      tone({ frequency: 440, endFrequency: 220, type: 'sine', duration: 0.3, volume: 0.1, when: 0.02 });
     },
-    explode() {
-      noise(0.28, 0.20, 900);
-      tone(90, 0.28, 'sine', 0.20, undefined, 40);
+    kill() {
+      if (!unlocked) return;
+      const now = context ? context.currentTime : 0;
+      if (now - lastKill < KILL_GAP) return;
+      lastKill = now;
+      tone({ frequency: 520, endFrequency: 180, type: 'triangle', duration: 0.09, volume: 0.08 });
+      noise({ duration: 0.06, volume: 0.05, filterFrequency: 2400, type: 'highpass' });
     },
-    waveHorn() {
-      if (context === null || muted) return;
-      const t0 = context.currentTime;
-      tone(392, 0.35, 'triangle', 0.16, t0);
-      tone(523.25, 0.5, 'triangle', 0.16, t0 + 0.18);
+    shard() {
+      if (!unlocked) return;
+      const now = context ? context.currentTime : 0;
+      if (now - lastShard < SHARD_GAP) return;
+      lastShard = now;
+      tone({ frequency: 1320, endFrequency: 1760, type: 'sine', duration: 0.08, volume: 0.05 });
+    },
+    pickup() {
+      tone({ frequency: 660, type: 'sine', duration: 0.1, volume: 0.1 });
+      tone({ frequency: 990, type: 'sine', duration: 0.14, volume: 0.1, when: 0.07 });
+    },
+    levelup() {
+      for (let index = 0; index < 4; index += 1) {
+        tone({ frequency: 440 * [1, 1.25, 1.5, 2][index], type: 'triangle', duration: 0.16, volume: 0.11, when: index * 0.07 });
+      }
     },
     upgrade() {
-      if (context === null || muted) return;
-      const t0 = context.currentTime;
-      tone(523.25, 0.14, 'sine', 0.14, t0);
-      tone(659.25, 0.14, 'sine', 0.14, t0 + 0.09);
-      tone(783.99, 0.22, 'sine', 0.14, t0 + 0.18);
+      tone({ frequency: 523, type: 'sine', duration: 0.12, volume: 0.1 });
+      tone({ frequency: 784, type: 'sine', duration: 0.18, volume: 0.1, when: 0.08 });
     },
-    gameOver() {
-      if (context === null || muted) return;
-      const t0 = context.currentTime;
-      tone(392, 0.3, 'triangle', 0.16, t0, 370);
-      tone(311, 0.3, 'triangle', 0.16, t0 + 0.28, 294);
-      tone(233, 0.6, 'triangle', 0.16, t0 + 0.56, 220);
+    dash() {
+      noise({ duration: 0.16, volume: 0.09, filterFrequency: 1400, type: 'bandpass', quality: 1.4 });
+    },
+    nova() {
+      tone({ frequency: 180, endFrequency: 720, type: 'sine', duration: 0.3, volume: 0.12 });
+      noise({ duration: 0.25, volume: 0.07, filterFrequency: 900 });
+    },
+    explode() {
+      tone({ frequency: 120, endFrequency: 40, type: 'sawtooth', duration: 0.4, volume: 0.18 });
+      noise({ duration: 0.35, volume: 0.14, filterFrequency: 500 });
+    },
+    waveHorn() {
+      tone({ frequency: 98, type: 'triangle', duration: 0.7, volume: 0.14 });
+      tone({ frequency: 147, type: 'triangle', duration: 0.7, volume: 0.1, when: 0.12 });
+    },
+    roar() {
+      tone({ frequency: 70, endFrequency: 46, type: 'sawtooth', duration: 1.1, volume: 0.2 });
+      tone({ frequency: 93, endFrequency: 55, type: 'sawtooth', duration: 1.1, volume: 0.14, when: 0.08 });
+      noise({ duration: 0.9, volume: 0.08, filterFrequency: 300 });
+    },
+    shieldUp() {
+      tone({ frequency: 392, endFrequency: 784, type: 'sine', duration: 0.25, volume: 0.1 });
+    },
+    click() {
+      tone({ frequency: 700, type: 'sine', duration: 0.05, volume: 0.06 });
     },
     victory() {
-      if (context === null || muted) return;
-      const t0 = context.currentTime;
-      [523.25, 659.25, 783.99, 1046.5].forEach((freq, i) => tone(freq, 0.35, 'triangle', 0.15, t0 + i * 0.13));
+      const notes = [523, 659, 784, 1047, 784, 1047];
+      notes.forEach((frequency, index) => {
+        tone({ frequency, type: 'triangle', duration: 0.3, volume: 0.12, when: index * 0.13 });
+      });
     },
-    /** Advance the music clock; schedules plucks just ahead of playback. */
-    music(dt) {
-      if (context === null || muted) return;
-      if (musicNext === 0) musicNext = context.currentTime + 0.1;
-      while (musicNext < context.currentTime + 0.25) {
-        const stepDur = 0.42;
-        if (musicStep % 8 === 0) {
-          // A low pad note at the top of each bar.
-          note(PENTATONIC[0] / 2, 3.2, 0.5);
-        }
-        if (musicStep % 2 === 0) {
-          const pick = PENTATONIC[(pluckIndex * 2 + (musicStep % 5)) % PENTATONIC.length];
-          note(pick, 1.4, 0.5);
-          pluckIndex += 1;
-        }
-        musicStep += 1;
-        musicNext += stepDur;
-      }
+    gameOver() {
+      tone({ frequency: 220, endFrequency: 55, type: 'triangle', duration: 1.4, volume: 0.16 });
+      tone({ frequency: 110, endFrequency: 49, type: 'sine', duration: 1.6, volume: 0.12, when: 0.15 });
     },
   };
 }

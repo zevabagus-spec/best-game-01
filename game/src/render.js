@@ -1,541 +1,870 @@
-// Drawing only: the world's state and the current screen in, pixels out. The
-// 1280x720 garden is scaled to fit the window and centred, the margin filled
-// with the night colour. Every sprite is drawn in code — glowing lantern,
-// flapping moths, ember trails — no image files, no fonts to fetch. Text that
-// holds a number is rebuilt only when the number changes, so a frame allocates
-// almost nothing.
-import { FIELD, FONT, LANTERN, PALETTE, PLAYER, TOTAL_WAVES } from './config.js';
+// Everything the eye sees: the abyss, the reef, the beacon, every creature,
+// the keeper, the projectiles, the HUD, and the screens on top. The field is
+// a fixed 1280x720; the renderer letterboxes it into the window at the
+// display's pixel ratio, so the game looks the same on any screen.
+
+import { BEACON, FIELD, FONT, PALETTE, PLAYER } from './config.js';
+import { TOTAL_TIDES as TIDE_COUNT } from './waves.js';
+import { drawOver, drawPaused, drawTitle, drawUpgrade, drawWin, pauseRects, SCREEN_OVER, SCREEN_PAUSED, SCREEN_TITLE, SCREEN_UPGRADE, SCREEN_WIN, upgradeRects } from './screens.js';
 import { createRandom } from './random.js';
+import { comboMultiplier, orbitalPositions } from './weapons.js';
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_UPGRADE = 'upgrade';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_OVER = 'over';
-export const SCREEN_WIN = 'win';
+const DECOR_SEED = 4242;
+const XP_SHARD_SIZE = 9;
 
-const PANEL = { width: 640, top: 150, line: 34, bottom: 76 };
-const CARDS = { width: 320, height: 210, gap: 24, top: 250 };
-const HEART = { size: 22, gap: 8 };
-
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+function buildDecor() {
+  const random = createRandom(DECOR_SEED);
+  const rocks = [];
+  const corals = [];
+  const kelp = [];
+  const bubbles = [];
+  for (let index = 0; index < 14; index += 1) {
+    let x = random.range(40, FIELD.width - 40);
+    let y = random.range(560, FIELD.height - 30);
+    if (Math.hypot(x - BEACON.x, y - BEACON.y) < 150) x = x < BEACON.x ? x - 160 : x + 160;
+    rocks.push({ x, y, radius: random.range(14, 34), seed: random.range(0, 6) });
+  }
+  const coralColors = ['#f472b6', '#fb923c', '#a3e635', '#c792ff', '#fda4af'];
+  for (let index = 0; index < 10; index += 1) {
+    corals.push({ x: random.range(50, FIELD.width - 50), y: random.range(600, FIELD.height - 16), height: random.range(18, 44), color: coralColors[index % coralColors.length], seed: random.range(0, 6) });
+  }
+  for (let index = 0; index < 18; index += 1) {
+    kelp.push({ x: random.range(20, FIELD.width - 20), height: random.range(40, 110), sway: random.range(0, Math.PI * 2), width: random.range(6, 11) });
+  }
+  for (let index = 0; index < 26; index += 1) {
+    bubbles.push({ x: random.range(0, FIELD.width), offset: random.range(0, 1), speed: random.range(14, 34), size: random.range(2, 6) });
+  }
+  return { rocks, corals, kelp, bubbles };
 }
 
 export function createRenderer(canvas) {
   const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('SCORE ');
-  const waveLabel = cachedLabel('WAVE ');
-  const bestLabel = cachedLabel('BEST ');
-  const finalLabel = cachedLabel('SCORE ');
-  const killsLabel = cachedLabel('Creatures banished ');
-  const shardsLabel = cachedLabel('Shards gathered ');
-  const comboLabel = cachedLabel('COMBO x');
-
-  // The garden's decorations: fixed positions from one seed, so every visit
-  // shows the same night garden.
-  const decorRandom = createRandom(20261115);
-  const stars = [];
-  for (let index = 0; index < 90; index += 1) {
-    stars.push({ x: decorRandom() * FIELD.width, y: decorRandom() * FIELD.height * 0.5, r: 0.6 + decorRandom() * 1.4, tw: decorRandom() * Math.PI * 2 });
-  }
-  const tufts = [];
-  for (let index = 0; index < 70; index += 1) {
-    tufts.push({ x: decorRandom() * FIELD.width, y: 60 + decorRandom() * (FIELD.height - 120), s: 0.7 + decorRandom() * 0.9 });
-  }
-  const flowers = [];
-  for (let index = 0; index < 26; index += 1) {
-    const colors = ['#f27bb1', '#b79ced', '#e8e36a', '#9fe870'];
-    flowers.push({ x: decorRandom() * FIELD.width, y: 60 + decorRandom() * (FIELD.height - 120), color: colors[index % colors.length] });
-  }
-  const stones = [];
-  for (let index = 0; index < 12; index += 1) {
-    const angle = (index / 12) * Math.PI * 2;
-    stones.push({ x: LANTERN.x + Math.cos(angle) * 74, y: LANTERN.y + Math.sin(angle) * 74, r: 7 + decorRandom() * 5 });
-  }
-
-  let skyGradient = null;
-  let glowGradient = null;
+  const decor = buildDecor();
+  let scale = 1;
+  let offsetX = 0;
+  let offsetY = 0;
+  let deviceScale = 1;
 
   function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
-    skyGradient = context.createLinearGradient(0, 0, 0, FIELD.height);
-    skyGradient.addColorStop(0, PALETTE.skyTop);
-    skyGradient.addColorStop(1, PALETTE.skyBottom);
-    glowGradient = context.createRadialGradient(LANTERN.x, LANTERN.y, 8, LANTERN.x, LANTERN.y, 240);
-    glowGradient.addColorStop(0, 'rgba(255, 179, 71, 0.30)');
-    glowGradient.addColorStop(0.5, 'rgba(255, 179, 71, 0.10)');
-    glowGradient.addColorStop(1, 'rgba(255, 179, 71, 0)');
+    deviceScale = Math.min(2, window.devicePixelRatio || 1);
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    canvas.width = Math.floor(width * deviceScale);
+    canvas.height = Math.floor(height * deviceScale);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    scale = Math.min(width / FIELD.width, height / FIELD.height);
+    offsetX = (width - FIELD.width * scale) / 2;
+    offsetY = (height - FIELD.height * scale) / 2;
   }
 
-  const fonts = new Map();
-  function text(value, x, y, size, color, align, weight) {
-    const key = `${weight ? 'bold ' : ''}${size}`;
-    if (!fonts.has(key)) fonts.set(key, `${weight ? '700 ' : ''}${size}px ${FONT}`);
-    context.font = fonts.get(key);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
+  function toField(x, y) {
+    return { x: (x - offsetX) / scale, y: (y - offsetY) / scale };
   }
 
-  function circle(x, y, radius, color) {
-    context.fillStyle = color;
-    context.beginPath();
-    context.arc(x, y, radius, 0, Math.PI * 2);
-    context.fill();
-  }
-
-  function drawGarden(state) {
-    context.fillStyle = skyGradient;
+  function drawBackground(time) {
+    const gradient = context.createLinearGradient(0, 0, 0, FIELD.height);
+    gradient.addColorStop(0, PALETTE.abyssTop);
+    gradient.addColorStop(1, PALETTE.abyssBottom);
+    context.fillStyle = gradient;
     context.fillRect(0, 0, FIELD.width, FIELD.height);
-    // Stars, twinkling with the clock.
-    for (let index = 0; index < stars.length; index += 1) {
-      const star = stars[index];
-      context.globalAlpha = 0.35 + 0.35 * Math.sin(state.time * 1.4 + star.tw);
-      circle(star.x, star.y, star.r, '#dfe6ff');
-    }
-    context.globalAlpha = 1;
-    // Grass: a dark wash, then tufts and flowers.
-    context.fillStyle = PALETTE.grass;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.strokeStyle = PALETTE.grassLight;
-    context.lineWidth = 2;
-    for (let index = 0; index < tufts.length; index += 1) {
-      const tuft = tufts[index];
+
+    // God rays from the surface, slowly swaying.
+    context.save();
+    context.globalAlpha = 0.5;
+    for (let index = 0; index < 4; index += 1) {
+      const sway = Math.sin(time * 0.12 + index * 1.7) * 40;
+      const x = 180 + index * 300 + sway;
+      const ray = context.createLinearGradient(x, 0, x + 90, FIELD.height);
+      ray.addColorStop(0, 'rgba(125, 232, 255, 0.10)');
+      ray.addColorStop(1, 'rgba(125, 232, 255, 0)');
+      context.fillStyle = ray;
       context.beginPath();
-      context.moveTo(tuft.x - 5 * tuft.s, tuft.y);
-      context.lineTo(tuft.x - 2 * tuft.s, tuft.y - 9 * tuft.s);
-      context.moveTo(tuft.x, tuft.y);
-      context.lineTo(tuft.x, tuft.y - 11 * tuft.s);
-      context.moveTo(tuft.x + 5 * tuft.s, tuft.y);
-      context.lineTo(tuft.x + 2 * tuft.s, tuft.y - 9 * tuft.s);
-      context.stroke();
+      context.moveTo(x, 0);
+      context.lineTo(x + 60, 0);
+      context.lineTo(x + 170, FIELD.height);
+      context.lineTo(x + 60, FIELD.height);
+      context.closePath();
+      context.fill();
     }
-    for (let index = 0; index < flowers.length; index += 1) {
-      const flower = flowers[index];
-      circle(flower.x, flower.y, 3.5, flower.color);
-      circle(flower.x, flower.y, 1.4, '#fff7d6');
-    }
-    // The stone ring where the lantern stands.
-    for (let index = 0; index < stones.length; index += 1) {
-      const stone = stones[index];
-      circle(stone.x, stone.y, stone.r, PALETTE.stone);
-      circle(stone.x - stone.r * 0.25, stone.y - stone.r * 0.25, stone.r * 0.45, '#4a5470');
-    }
-    context.fillStyle = '#20263c';
-    context.beginPath();
-    context.arc(LANTERN.x, LANTERN.y, 58, 0, Math.PI * 2);
-    context.fill();
-  }
+    context.restore();
 
-  function drawLantern(state) {
-    const flicker = 0.9 + 0.1 * Math.sin(state.time * 7) + 0.04 * Math.sin(state.time * 13.7);
-    const health = state.lantern.hp / state.lantern.maxHp;
-    context.globalAlpha = (0.55 + 0.45 * health) * flicker;
-    context.fillStyle = glowGradient;
-    context.fillRect(LANTERN.x - 240, LANTERN.y - 240, 480, 480);
-    context.globalAlpha = 1;
-    // The lantern itself: a post, a warm orb, a little roof.
-    context.fillStyle = '#2c3350';
-    context.fillRect(LANTERN.x - 4, LANTERN.y + 8, 8, 22);
-    context.fillStyle = '#3a4157';
+    // The reef floor.
+    context.fillStyle = PALETTE.reef;
     context.beginPath();
-    context.moveTo(LANTERN.x - 20, LANTERN.y - 12);
-    context.lineTo(LANTERN.x + 20, LANTERN.y - 12);
-    context.lineTo(LANTERN.x + 12, LANTERN.y - 24);
-    context.lineTo(LANTERN.x - 12, LANTERN.y - 24);
+    context.moveTo(0, FIELD.height - 60);
+    for (let x = 0; x <= FIELD.width; x += 80) {
+      context.lineTo(x, FIELD.height - 60 + Math.sin(x * 0.008 + 1.3) * 12);
+    }
+    context.lineTo(FIELD.width, FIELD.height);
+    context.lineTo(0, FIELD.height);
     context.closePath();
     context.fill();
-    const orb = context.createRadialGradient(LANTERN.x, LANTERN.y + 4, 2, LANTERN.x, LANTERN.y + 4, LANTERN.radius);
-    orb.addColorStop(0, PALETTE.lanternCore);
-    orb.addColorStop(1, PALETTE.lanternGlow);
-    context.fillStyle = orb;
+
+    for (const rock of decor.rocks) {
+      context.fillStyle = PALETTE.rock;
+      context.strokeStyle = PALETTE.rockEdge;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.ellipse(rock.x, rock.y, rock.radius, rock.radius * 0.62, rock.seed, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+    }
+    for (const coral of decor.corals) {
+      context.strokeStyle = coral.color;
+      context.lineWidth = 4;
+      context.lineCap = 'round';
+      for (const branch of [-1, 0, 1]) {
+        context.beginPath();
+        context.moveTo(coral.x, coral.y);
+        context.quadraticCurveTo(coral.x + branch * 8, coral.y - coral.height * 0.6, coral.x + branch * 14, coral.y - coral.height);
+        context.stroke();
+      }
+      context.fillStyle = coral.color;
+      context.beginPath();
+      context.arc(coral.x, coral.y - coral.height, 4, 0, Math.PI * 2);
+      context.fill();
+    }
+    for (const strand of decor.kelp) {
+      const sway = Math.sin(time * 0.8 + strand.sway) * 10;
+      context.strokeStyle = PALETTE.reefLight;
+      context.lineWidth = strand.width;
+      context.lineCap = 'round';
+      context.beginPath();
+      context.moveTo(strand.x, FIELD.height - 8);
+      context.quadraticCurveTo(strand.x + sway * 0.4, FIELD.height - strand.height * 0.6, strand.x + sway, FIELD.height - strand.height);
+      context.stroke();
+    }
+    context.fillStyle = 'rgba(186, 230, 253, 0.35)';
+    for (const bubble of decor.bubbles) {
+      const y = FIELD.height - ((time * bubble.speed + bubble.offset * FIELD.height) % (FIELD.height + 20));
+      context.beginPath();
+      context.arc(bubble.x + Math.sin(time + bubble.offset * 9) * 6, y, bubble.size, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+
+  function drawBeacon(state, time) {
+    const { x, y } = BEACON;
+    const hpFraction = Math.max(0, state.beacon.hp / state.beacon.maxHp);
+    const pulse = 0.85 + Math.sin(time * 2) * 0.15;
+
+    // The glow that fills the reef.
+    const glow = context.createRadialGradient(x, y, 10, x, y, 220 * pulse);
+    glow.addColorStop(0, `rgba(125, 232, 255, ${0.34 * hpFraction + 0.06})`);
+    glow.addColorStop(1, 'rgba(125, 232, 255, 0)');
+    context.fillStyle = glow;
     context.beginPath();
-    context.arc(LANTERN.x, LANTERN.y + 4, LANTERN.radius, 0, Math.PI * 2);
+    context.arc(x, y, 220 * pulse, 0, Math.PI * 2);
     context.fill();
-    // Health ring around the lantern: the light itself shows how much is left.
-    context.strokeStyle = health > 0.4 ? PALETTE.lanternGlow : PALETTE.danger;
+
+    // The rotating beam.
+    const beamAngle = time * 0.5;
+    context.save();
+    context.translate(x, y - 46);
+    context.rotate(beamAngle);
+    const beam = context.createLinearGradient(0, 0, 420, 0);
+    beam.addColorStop(0, PALETTE.beam);
+    beam.addColorStop(1, 'rgba(125, 232, 255, 0)');
+    context.fillStyle = beam;
+    context.beginPath();
+    context.moveTo(0, -10);
+    context.lineTo(420, -64);
+    context.lineTo(420, 64);
+    context.lineTo(0, 10);
+    context.closePath();
+    context.fill();
+    context.restore();
+
+    // Rock, tower, lamp room and light.
+    context.fillStyle = PALETTE.rock;
+    context.strokeStyle = PALETTE.rockEdge;
+    context.lineWidth = 2;
+    context.beginPath();
+    context.ellipse(x, y + 22, 46, 18, 0, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.fillStyle = '#e2e8f0';
+    context.beginPath();
+    context.moveTo(x - 13, y + 16);
+    context.lineTo(x - 9, y - 34);
+    context.lineTo(x + 9, y - 34);
+    context.lineTo(x + 13, y + 16);
+    context.closePath();
+    context.fill();
+    context.fillStyle = '#0e7490';
+    context.fillRect(x - 10, y - 14, 20, 8);
+    context.fillStyle = PALETTE.beaconCore;
+    context.beginPath();
+    context.arc(x, y - 42, 11 * pulse, 0, Math.PI * 2);
+    context.fill();
+    context.strokeStyle = '#155e75';
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(x, y - 42, 13, 0, Math.PI * 2);
+    context.stroke();
+
+    // The light's remaining strength, as a ring.
+    context.strokeStyle = 'rgba(125, 232, 255, 0.25)';
     context.lineWidth = 5;
     context.beginPath();
-    context.arc(LANTERN.x, LANTERN.y + 4, LANTERN.radius + 10, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * health);
+    context.arc(x, y, BEACON.radius + 14, 0, Math.PI * 2);
     context.stroke();
+    context.strokeStyle = hpFraction > 0.5 ? PALETTE.beaconGlow : hpFraction > 0.25 ? PALETTE.gold : PALETTE.danger;
+    context.beginPath();
+    context.arc(x, y, BEACON.radius + 14, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * hpFraction);
+    context.stroke();
+  }
+
+  function drawShards(state, time) {
+    for (const shard of state.shards) {
+      if (!shard.active) continue;
+      const blink = shard.life < 4 ? (Math.sin(time * 12) > 0 ? 1 : 0.3) : 1;
+      const size = XP_SHARD_SIZE * (1 + Math.sin(time * 4 + shard.x) * 0.15);
+      context.save();
+      context.globalAlpha = blink;
+      context.translate(shard.x, shard.y);
+      context.rotate(Math.PI / 4);
+      context.fillStyle = PALETTE.shard;
+      context.fillRect(-size / 2, -size / 2, size, size);
+      context.fillStyle = '#ecfeff';
+      context.fillRect(-size / 4, -size / 4, size / 2, size / 2);
+      context.restore();
+    }
+  }
+
+  function drawHeartShape(x, y, size, color) {
+    context.fillStyle = color;
+    context.beginPath();
+    context.moveTo(x, y + size * 0.9);
+    context.bezierCurveTo(x - size * 1.3, y, x - size * 0.7, y - size, x, y - size * 0.35);
+    context.bezierCurveTo(x + size * 0.7, y - size, x + size * 1.3, y, x, y + size * 0.9);
+    context.closePath();
+    context.fill();
+  }
+
+  function drawPickups(state, time) {
+    for (const pickup of state.pickups) {
+      if (!pickup.active) continue;
+      const bob = Math.sin(pickup.bob) * 4;
+      const x = pickup.x;
+      const y = pickup.y + bob;
+      const blink = pickup.life < 3 ? (Math.sin(time * 12) > 0 ? 1 : 0.35) : 1;
+      context.save();
+      context.globalAlpha = blink;
+      const glowColor = pickup.kind === 'heart' ? PALETTE.heart : pickup.kind === 'magnet' ? PALETTE.magnet : pickup.kind === 'shield' ? PALETTE.shield : PALETTE.bomb;
+      const glow = context.createRadialGradient(x, y, 2, x, y, 26);
+      glow.addColorStop(0, glowColor);
+      glow.addColorStop(1, 'rgba(0,0,0,0)');
+      context.globalAlpha = blink * 0.35;
+      context.fillStyle = glow;
+      context.beginPath();
+      context.arc(x, y, 26, 0, Math.PI * 2);
+      context.fill();
+      context.globalAlpha = blink;
+      if (pickup.kind === 'heart') {
+        drawHeartShape(x, y - 2, 11, PALETTE.heart);
+      } else if (pickup.kind === 'magnet') {
+        context.strokeStyle = PALETTE.magnet;
+        context.lineWidth = 6;
+        context.beginPath();
+        context.arc(x, y - 2, 10, Math.PI, 0, false);
+        context.stroke();
+        context.beginPath();
+        context.moveTo(x - 10, y - 2);
+        context.lineTo(x - 10, y + 9);
+        context.moveTo(x + 10, y - 2);
+        context.lineTo(x + 10, y + 9);
+        context.stroke();
+      } else if (pickup.kind === 'shield') {
+        context.fillStyle = PALETTE.shield;
+        context.beginPath();
+        context.moveTo(x, y - 13);
+        context.lineTo(x + 11, y - 6);
+        context.lineTo(x + 8, y + 9);
+        context.lineTo(x, y + 14);
+        context.lineTo(x - 8, y + 9);
+        context.lineTo(x - 11, y - 6);
+        context.closePath();
+        context.fill();
+        context.fillStyle = '#eff6ff';
+        context.beginPath();
+        context.arc(x, y - 1, 4, 0, Math.PI * 2);
+        context.fill();
+      } else {
+        context.fillStyle = '#1f2937';
+        context.beginPath();
+        context.arc(x, y + 2, 11, 0, Math.PI * 2);
+        context.fill();
+        context.strokeStyle = '#fca5a5';
+        context.lineWidth = 2;
+        context.beginPath();
+        context.moveTo(x + 6, y - 7);
+        context.quadraticCurveTo(x + 12, y - 14, x + 16, y - 11);
+        context.stroke();
+        context.fillStyle = PALETTE.bomb;
+        context.beginPath();
+        context.arc(x + 16, y - 11, 3.5, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.restore();
+    }
+  }
+
+  function drawMines(state, time) {
+    for (const mine of state.mines) {
+      if (!mine.active) continue;
+      const armed = mine.armTimer <= 0;
+      const blink = armed && Math.sin(time * 6) > 0.4;
+      context.fillStyle = blink ? '#fbcfe8' : '#3b0764';
+      context.beginPath();
+      context.arc(mine.x, mine.y, mine.radius, 0, Math.PI * 2);
+      context.fill();
+      context.strokeStyle = PALETTE.mine;
+      context.lineWidth = 2;
+      for (let spike = 0; spike < 8; spike += 1) {
+        const angle = (spike / 8) * Math.PI * 2;
+        context.beginPath();
+        context.moveTo(mine.x + Math.cos(angle) * mine.radius, mine.y + Math.sin(angle) * mine.radius);
+        context.lineTo(mine.x + Math.cos(angle) * (mine.radius + 6), mine.y + Math.sin(angle) * (mine.radius + 6));
+        context.stroke();
+      }
+      context.fillStyle = PALETTE.mine;
+      context.beginPath();
+      context.arc(mine.x, mine.y, 4, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+
+  function drawEnemyHp(enemy) {
+    if (enemy.hp >= enemy.maxHp) return;
+    const width = enemy.radius * 2;
+    const x = enemy.x - enemy.radius;
+    const y = enemy.y - enemy.radius - 12;
+    context.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    context.fillRect(x, y, width, 4);
+    context.fillStyle = enemy.hp / enemy.maxHp > 0.4 ? '#4ade80' : PALETTE.danger;
+    context.fillRect(x, y, width * Math.max(0, enemy.hp / enemy.maxHp), 4);
   }
 
   function drawEnemy(enemy, time) {
     const flash = enemy.flash > 0;
-    const flap = Math.sin(time * 14 + enemy.wobble * 5);
     context.save();
+    if (enemy.phased) context.globalAlpha = 0.35;
+    const pulse = 1 + Math.sin(time * 3 + enemy.wobble) * 0.08;
     context.translate(enemy.x, enemy.y);
-    if (enemy.kind === 'moth') {
-      const wing = 1 + flap * 0.35;
-      context.fillStyle = PALETTE.mothWing;
+    context.scale(pulse, pulse);
+    const body = flash ? '#ffffff' : null;
+    if (enemy.kind === 'drifter') {
+      context.fillStyle = body ?? PALETTE.drifterBell;
       context.beginPath();
-      context.ellipse(-enemy.radius * 0.8, -4, enemy.radius * 0.9, enemy.radius * 0.55 * wing, -0.5, 0, Math.PI * 2);
-      context.ellipse(enemy.radius * 0.8, -4, enemy.radius * 0.9, enemy.radius * 0.55 * wing, 0.5, 0, Math.PI * 2);
+      context.arc(0, -2, enemy.radius, Math.PI, 0);
+      context.quadraticCurveTo(enemy.radius, enemy.radius * 0.4, 0, enemy.radius * 0.3);
+      context.quadraticCurveTo(-enemy.radius, enemy.radius * 0.4, -enemy.radius, -2);
+      context.closePath();
       context.fill();
-      context.fillStyle = PALETTE.moth;
-      context.beginPath();
-      context.ellipse(0, 0, enemy.radius * 0.45, enemy.radius * 0.9, 0, 0, Math.PI * 2);
-      context.fill();
-      circle(-3, -enemy.radius * 0.4, 1.6, '#1a1030');
-      circle(3, -enemy.radius * 0.4, 1.6, '#1a1030');
-    } else if (enemy.kind === 'gnat') {
-      context.globalAlpha = 0.9;
-      circle(0, 0, enemy.radius, PALETTE.gnat);
-      context.globalAlpha = 0.5;
-      context.fillStyle = '#ffffff';
-      context.beginPath();
-      context.ellipse(-enemy.radius, -enemy.radius * 0.6, enemy.radius * 0.9, enemy.radius * 0.4 * (1 + flap * 0.4), -0.6, 0, Math.PI * 2);
-      context.ellipse(enemy.radius, -enemy.radius * 0.6, enemy.radius * 0.9, enemy.radius * 0.4 * (1 + flap * 0.4), 0.6, 0, Math.PI * 2);
-      context.fill();
-      context.globalAlpha = 1;
-    } else if (enemy.kind === 'beetle') {
-      context.strokeStyle = '#2a0f0c';
+      context.strokeStyle = body ?? PALETTE.drifter;
       context.lineWidth = 2;
-      for (let leg = -1; leg <= 1; leg += 1) {
+      for (let tentacle = -2; tentacle <= 2; tentacle += 1) {
+        const wave = Math.sin(time * 4 + enemy.wobble + tentacle) * 4;
         context.beginPath();
-        context.moveTo(-enemy.radius * 0.6, leg * enemy.radius * 0.5);
-        context.lineTo(-enemy.radius * 1.25, leg * enemy.radius * 0.8);
-        context.moveTo(enemy.radius * 0.6, leg * enemy.radius * 0.5);
-        context.lineTo(enemy.radius * 1.25, leg * enemy.radius * 0.8);
+        context.moveTo(tentacle * 5, enemy.radius * 0.3);
+        context.quadraticCurveTo(tentacle * 5 + wave, enemy.radius * 0.8, tentacle * 5 - wave, enemy.radius * 1.3);
         context.stroke();
       }
-      context.fillStyle = PALETTE.beetle;
+    } else if (enemy.kind === 'dart') {
+      const angle = Math.atan2(enemy.vy, enemy.vx);
+      context.rotate(angle);
+      context.fillStyle = body ?? PALETTE.dart;
+      context.beginPath();
+      context.moveTo(enemy.radius + 4, 0);
+      context.lineTo(-enemy.radius * 0.6, -enemy.radius * 0.7);
+      context.lineTo(-enemy.radius * 0.2, 0);
+      context.lineTo(-enemy.radius * 0.6, enemy.radius * 0.7);
+      context.closePath();
+      context.fill();
+      context.fillStyle = '#fff1f2';
+      context.beginPath();
+      context.arc(enemy.radius * 0.4, -2, 2.5, 0, Math.PI * 2);
+      context.fill();
+    } else if (enemy.kind === 'spitter') {
+      context.fillStyle = body ?? PALETTE.spitter;
       context.beginPath();
       context.arc(0, 0, enemy.radius, 0, Math.PI * 2);
       context.fill();
-      context.fillStyle = PALETTE.beetleShell;
-      context.beginPath();
-      context.arc(0, -enemy.radius * 0.25, enemy.radius * 0.62, 0, Math.PI * 2);
-      context.fill();
-      context.strokeStyle = PALETTE.beetleShell;
+      context.strokeStyle = body ?? PALETTE.spitterCore;
       context.lineWidth = 2;
+      for (let spike = 0; spike < 8; spike += 1) {
+        const angle = (spike / 8) * Math.PI * 2 + time;
+        context.beginPath();
+        context.moveTo(Math.cos(angle) * enemy.radius * 0.7, Math.sin(angle) * enemy.radius * 0.7);
+        context.lineTo(Math.cos(angle) * (enemy.radius + 5), Math.sin(angle) * (enemy.radius + 5));
+        context.stroke();
+      }
+      context.fillStyle = '#451a03';
+      context.beginPath();
+      context.arc(0, 0, 5, 0, Math.PI * 2);
+      context.fill();
+    } else if (enemy.kind === 'brute') {
+      context.fillStyle = body ?? PALETTE.bruteShell;
+      context.beginPath();
+      context.arc(0, 0, enemy.radius, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = body ?? PALETTE.brute;
+      context.beginPath();
+      context.arc(0, -3, enemy.radius * 0.7, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = '#fecdd3';
+      context.beginPath();
+      context.arc(-6, -6, 3, 0, Math.PI * 2);
+      context.arc(6, -6, 3, 0, Math.PI * 2);
+      context.fill();
+      context.strokeStyle = body ?? PALETTE.brute;
+      context.lineWidth = 4;
+      context.beginPath();
+      context.moveTo(-enemy.radius, 4);
+      context.lineTo(-enemy.radius - 8, 10);
+      context.moveTo(enemy.radius, 4);
+      context.lineTo(enemy.radius + 8, 10);
+      context.stroke();
+    } else if (enemy.kind === 'splitter') {
+      const wobble = 1 + Math.sin(time * 5 + enemy.wobble) * 0.12;
+      context.scale(wobble, 1 / wobble);
+      context.fillStyle = body ?? PALETTE.splitter;
+      context.beginPath();
+      context.arc(0, 0, enemy.radius, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = body ?? PALETTE.splitterCore;
+      context.beginPath();
+      context.arc(-4, -4, enemy.radius * 0.35, 0, Math.PI * 2);
+      context.arc(5, 5, enemy.radius * 0.28, 0, Math.PI * 2);
+      context.fill();
+    } else if (enemy.kind === 'mote') {
+      context.fillStyle = body ?? PALETTE.mote;
+      context.beginPath();
+      context.arc(0, 0, enemy.radius, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = '#fefce8';
+      context.beginPath();
+      context.arc(0, 0, enemy.radius * 0.45, 0, Math.PI * 2);
+      context.fill();
+    } else if (enemy.kind === 'stalker') {
+      const angle = Math.atan2(enemy.vy, enemy.vx);
+      context.rotate(angle);
+      context.fillStyle = body ?? PALETTE.stalker;
+      for (let segment = 0; segment < 3; segment += 1) {
+        const sway = Math.sin(time * 6 + enemy.wobble - segment) * 3;
+        context.beginPath();
+        context.ellipse(-segment * 9, sway, 9, 6, 0, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.fillStyle = '#fdf4ff';
+      context.beginPath();
+      context.arc(5, -2, 2.5, 0, Math.PI * 2);
+      context.fill();
+    } else if (enemy.kind === 'wraith') {
+      context.fillStyle = body ?? PALETTE.wraith;
       context.beginPath();
       context.moveTo(0, -enemy.radius);
+      context.arc(0, -2, enemy.radius * 0.85, -Math.PI / 2 - 0.6, -Math.PI / 2 + Math.PI + 0.6);
+      context.lineTo(-enemy.radius * 0.8, enemy.radius);
+      context.lineTo(-enemy.radius * 0.4, enemy.radius * 0.6);
       context.lineTo(0, enemy.radius);
-      context.stroke();
-    } else if (enemy.kind === 'bomber') {
-      const pulse = 1 + Math.sin(time * 6 + enemy.wobble) * 0.18;
-      context.globalAlpha = 0.35;
-      circle(0, 0, enemy.radius * 1.9 * pulse, PALETTE.bomber);
-      context.globalAlpha = 1;
-      circle(0, 0, enemy.radius * pulse, PALETTE.bomber);
-      circle(0, 0, enemy.radius * 0.45, PALETTE.bomberCore);
-    } else if (enemy.kind === 'thief') {
-      context.rotate(Math.sin(time * 9 + enemy.wobble) * 0.3);
-      context.fillStyle = PALETTE.thief;
-      context.beginPath();
-      context.moveTo(0, -enemy.radius * 1.3);
-      context.lineTo(enemy.radius, 0);
-      context.lineTo(0, enemy.radius * 1.3);
-      context.lineTo(-enemy.radius, 0);
+      context.lineTo(enemy.radius * 0.4, enemy.radius * 0.6);
+      context.lineTo(enemy.radius * 0.8, enemy.radius);
       context.closePath();
       context.fill();
-      circle(0, 0, enemy.radius * 0.35, '#ffffff');
-    } else if (enemy.kind === 'queen') {
-      const wing = 1 + flap * 0.25;
-      context.fillStyle = PALETTE.queenWing;
+      context.fillStyle = '#1e1b4b';
       context.beginPath();
-      context.ellipse(-enemy.radius * 0.95, -6, enemy.radius * 1.05, enemy.radius * 0.6 * wing, -0.45, 0, Math.PI * 2);
-      context.ellipse(enemy.radius * 0.95, -6, enemy.radius * 1.05, enemy.radius * 0.6 * wing, 0.45, 0, Math.PI * 2);
+      context.arc(-4, -4, 2.5, 0, Math.PI * 2);
+      context.arc(4, -4, 2.5, 0, Math.PI * 2);
       context.fill();
-      context.fillStyle = PALETTE.queen;
-      context.beginPath();
-      context.ellipse(0, 0, enemy.radius * 0.5, enemy.radius * 0.95, 0, 0, Math.PI * 2);
-      context.fill();
-      // Crown spikes.
-      context.strokeStyle = PALETTE.lanternGlow;
-      context.lineWidth = 3;
-      context.beginPath();
-      context.moveTo(-12, -enemy.radius * 0.8);
-      context.lineTo(-8, -enemy.radius * 1.25);
-      context.moveTo(0, -enemy.radius * 0.9);
-      context.lineTo(0, -enemy.radius * 1.4);
-      context.moveTo(12, -enemy.radius * 0.8);
-      context.lineTo(8, -enemy.radius * 1.25);
-      context.stroke();
-      circle(-5, -enemy.radius * 0.35, 2.5, '#1a1030');
-      circle(5, -enemy.radius * 0.35, 2.5, '#1a1030');
-      // Health bar over the queen.
-      context.fillStyle = 'rgba(0, 0, 0, 0.5)';
-      context.fillRect(-34, -enemy.radius - 18, 68, 7);
-      context.fillStyle = PALETTE.queen;
-      context.fillRect(-34, -enemy.radius - 18, 68 * (enemy.hp / enemy.maxHp), 7);
-    }
-    if (flash) {
-      context.globalAlpha = 0.65;
-      circle(0, 0, enemy.radius, '#ffffff');
-      context.globalAlpha = 1;
     }
     context.restore();
+    if (enemy.elite) {
+      context.strokeStyle = PALETTE.gold;
+      context.lineWidth = 2;
+      context.setLineDash([6, 5]);
+      context.beginPath();
+      context.arc(enemy.x, enemy.y, enemy.radius + 6, time * 1.5, time * 1.5 + Math.PI * 2);
+      context.stroke();
+      context.setLineDash([]);
+    }
+    drawEnemyHp(enemy);
+  }
+
+  function drawBoss(state, time) {
+    const boss = state.boss;
+    if (boss === null || !boss.active) return;
+    if (boss.chargeState === 'telegraph') {
+      context.strokeStyle = 'rgba(225, 29, 72, 0.5)';
+      context.lineWidth = boss.radius * 1.4;
+      context.lineCap = 'round';
+      context.beginPath();
+      context.moveTo(boss.x, boss.y);
+      context.lineTo(boss.chargeX, boss.chargeY);
+      context.stroke();
+      context.lineCap = 'butt';
+    }
+    const flash = boss.flash > 0;
+    const breathe = 1 + Math.sin(time * 1.8) * 0.04;
+    context.save();
+    context.translate(boss.x, boss.y);
+    context.scale(breathe, breathe);
+    const jawOpen = boss.phase === 3 ? 0.5 : boss.phase === 2 ? 0.38 : 0.28;
+    context.fillStyle = PALETTE.maw;
+    context.beginPath();
+    context.arc(0, 0, boss.radius, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = PALETTE.mawBelly;
+    context.beginPath();
+    context.ellipse(0, boss.radius * 0.35, boss.radius * 0.7, boss.radius * 0.45, 0, 0, Math.PI * 2);
+    context.fill();
+    // Jaws: two crescents opening toward the beacon below.
+    context.fillStyle = '#450a0a';
+    context.beginPath();
+    context.moveTo(-boss.radius * 0.7, boss.radius * 0.1);
+    context.quadraticCurveTo(0, boss.radius * (0.1 + jawOpen), boss.radius * 0.7, boss.radius * 0.1);
+    context.quadraticCurveTo(0, boss.radius * 0.75, -boss.radius * 0.7, boss.radius * 0.1);
+    context.closePath();
+    context.fill();
+    context.fillStyle = '#fef2f2';
+    for (let tooth = -2; tooth <= 2; tooth += 1) {
+      context.beginPath();
+      context.moveTo(tooth * 13 - 5, boss.radius * 0.12);
+      context.lineTo(tooth * 13 + 5, boss.radius * 0.12);
+      context.lineTo(tooth * 13, boss.radius * 0.34);
+      context.closePath();
+      context.fill();
+    }
+    // Eyes: three, watching.
+    for (const eyeX of [-20, 0, 20]) {
+      context.fillStyle = PALETTE.mawEye;
+      context.beginPath();
+      context.arc(eyeX, -boss.radius * 0.42, 6, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = '#111827';
+      context.beginPath();
+      context.arc(eyeX, -boss.radius * 0.42, 3, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.restore();
+    // Spikes around the crown.
+    context.fillStyle = PALETTE.mawBelly;
+    for (let spike = 0; spike < 7; spike += 1) {
+      const angle = Math.PI + (spike / 6) * Math.PI;
+      const sx = boss.x + Math.cos(angle) * boss.radius;
+      const sy = boss.y + Math.sin(angle) * boss.radius;
+      context.beginPath();
+      context.moveTo(sx - 6, sy);
+      context.lineTo(sx + 6, sy);
+      context.lineTo(sx + Math.cos(angle) * 14, sy + Math.sin(angle) * 14);
+      context.closePath();
+      context.fill();
+    }
+    // A hit lands as a pale shimmer over the Maw, never a white-out.
+    if (flash) {
+      context.globalAlpha = Math.min(0.4, boss.flash / 0.09 * 0.4);
+      context.fillStyle = '#ffffff';
+      context.beginPath();
+      context.arc(boss.x, boss.y, boss.radius, 0, Math.PI * 2);
+      context.fill();
+      context.globalAlpha = 1;
+    }
   }
 
   function drawPlayer(state, time) {
     const player = state.player;
-    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
-      const bob = Math.sin(time * 3) * 3;
-      const glow = context.createRadialGradient(player.x, player.y + bob, 2, player.x, player.y + bob, 44);
-      glow.addColorStop(0, 'rgba(142, 246, 255, 0.5)');
-      glow.addColorStop(1, 'rgba(142, 246, 255, 0)');
-      context.fillStyle = glow;
-      context.fillRect(player.x - 44, player.y + bob - 44, 88, 88);
-      // The keeper: a little hooded wisp with a warm ember heart.
-      context.fillStyle = PALETTE.player;
+    if (player.invulnerable > 0 && Math.sin(time * 30) > 0) context.globalAlpha = 0.45;
+    const aimAngle = Math.atan2(player.aimY - player.y, player.aimX - player.x);
+    context.save();
+    context.translate(player.x, player.y);
+
+    // Aim guide: three fading dots toward the pointer.
+    context.fillStyle = 'rgba(158, 243, 255, 0.5)';
+    for (let dot = 1; dot <= 3; dot += 1) {
       context.beginPath();
-      context.moveTo(player.x, player.y + bob - PLAYER.radius - 6);
-      context.quadraticCurveTo(player.x + PLAYER.radius + 2, player.y + bob - 4, player.x + PLAYER.radius * 0.7, player.y + bob + PLAYER.radius * 0.8);
-      context.quadraticCurveTo(player.x, player.y + bob + PLAYER.radius * 0.4, player.x - PLAYER.radius * 0.7, player.y + bob + PLAYER.radius * 0.8);
-      context.quadraticCurveTo(player.x - PLAYER.radius - 2, player.y + bob - 4, player.x, player.y + bob - PLAYER.radius - 6);
+      context.arc(Math.cos(aimAngle) * (22 + dot * 12), Math.sin(aimAngle) * (22 + dot * 12), 2.5 - dot * 0.5, 0, Math.PI * 2);
       context.fill();
-      circle(player.x, player.y + bob - 2, 4, PALETTE.emberCore);
-      circle(player.x - 5, player.y + bob - 8, 1.8, '#0a2030');
-      circle(player.x + 5, player.y + bob - 8, 1.8, '#0a2030');
-      // Aim tick: a short line toward the mouse.
-      const aimDx = player.aimX - player.x;
-      const aimDy = player.aimY - player.y;
-      const aimLen = Math.hypot(aimDx, aimDy) || 1;
-      context.strokeStyle = 'rgba(142, 246, 255, 0.55)';
-      context.lineWidth = 2;
+    }
+
+    // The keeper: a glowing diver with a lamp-staff.
+    const glow = context.createRadialGradient(0, 0, 4, 0, 0, 34);
+    glow.addColorStop(0, 'rgba(94, 234, 212, 0.35)');
+    glow.addColorStop(1, 'rgba(94, 234, 212, 0)');
+    context.fillStyle = glow;
+    context.beginPath();
+    context.arc(0, 0, 34, 0, Math.PI * 2);
+    context.fill();
+    context.rotate(aimAngle);
+    context.fillStyle = PALETTE.playerSuit;
+    context.beginPath();
+    context.arc(0, 0, PLAYER.radius, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = PALETTE.player;
+    context.beginPath();
+    context.arc(0, 0, PLAYER.radius - 4, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = PALETTE.playerCore;
+    context.beginPath();
+    context.arc(4, 0, 6, 0, Math.PI * 2);
+    context.fill();
+    context.strokeStyle = '#134e4a';
+    context.lineWidth = 3;
+    context.beginPath();
+    context.moveTo(6, 4);
+    context.lineTo(20, 8);
+    context.stroke();
+    context.fillStyle = PALETTE.beaconCore;
+    context.beginPath();
+    context.arc(22, 9, 4, 0, Math.PI * 2);
+    context.fill();
+    context.restore();
+    context.globalAlpha = 1;
+
+    if (player.shield > 0) {
+      const shimmer = 0.5 + Math.sin(time * 5) * 0.2;
+      context.strokeStyle = `rgba(147, 197, 253, ${shimmer})`;
+      context.lineWidth = 3;
       context.beginPath();
-      context.moveTo(player.x + (aimDx / aimLen) * (PLAYER.radius + 4), player.y + (aimDy / aimLen) * (PLAYER.radius + 4));
-      context.lineTo(player.x + (aimDx / aimLen) * (PLAYER.radius + 14), player.y + (aimDy / aimLen) * (PLAYER.radius + 14));
+      context.arc(player.x, player.y, PLAYER.radius + 10, 0, Math.PI * 2);
       context.stroke();
     }
   }
 
-  function drawHud(state, best, muted) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 24, 18, 28, PALETTE.text, 'left', true);
-    if (state.multiplier > 1) {
-      text(comboLabel(state.multiplier), 24, 52, 20, PALETTE.cardPick, 'left', true);
-    }
-    text(`${waveLabel(state.wave)} / ${TOTAL_WAVES}`, FIELD.width / 2, 18, 28, PALETTE.text, 'center', true);
-    text(bestLabel(best), FIELD.width - 24, 18, 24, PALETTE.muted, 'right');
-    // Hearts, top right under the best score.
-    const firstHeart = FIELD.width - 24 - state.player.maxHp * (HEART.size + HEART.gap) + HEART.gap;
-    for (let heart = 0; heart < state.player.maxHp; heart += 1) {
-      const x = firstHeart + heart * (HEART.size + HEART.gap);
-      const y = 52;
-      context.fillStyle = heart < state.player.hp ? '#ff6b81' : 'rgba(255, 255, 255, 0.15)';
+  function drawProjectiles(state) {
+    for (const bolt of state.bolts) {
+      if (!bolt.active) continue;
+      const angle = Math.atan2(bolt.vy, bolt.vx);
+      // A short trail, so a volley reads even in a still frame.
+      context.strokeStyle = bolt.crit ? PALETTE.gold : PALETTE.bolt;
+      context.globalAlpha = 0.45;
+      context.lineWidth = 3;
       context.beginPath();
-      context.moveTo(x + HEART.size / 2, y + HEART.size * 0.9);
-      context.bezierCurveTo(x, y + HEART.size * 0.45, x + HEART.size * 0.15, y, x + HEART.size / 2, y + HEART.size * 0.3);
-      context.bezierCurveTo(x + HEART.size * 0.85, y, x + HEART.size, y + HEART.size * 0.45, x + HEART.size / 2, y + HEART.size * 0.9);
-      context.fill();
-    }
-    // Lantern light bar, top right under the hearts.
-    const barWidth = 190;
-    const barX = FIELD.width - 24 - barWidth;
-    const barY = 86;
-    const health = state.lantern.hp / state.lantern.maxHp;
-    context.fillStyle = 'rgba(0, 0, 0, 0.45)';
-    context.fillRect(barX, barY, barWidth, 12);
-    context.fillStyle = health > 0.4 ? PALETTE.lanternGlow : PALETTE.danger;
-    context.fillRect(barX, barY, barWidth * health, 12);
-    text('LANTERN', barX, barY - 20, 13, PALETTE.muted, 'left');
-    if (muted) text('M — sound off', FIELD.width - 24, FIELD.height - 30, 15, PALETTE.muted, 'right');
-  }
-
-  function drawBanner(state) {
-    if (state.bannerTimer <= 0 || !state.banner) return;
-    const alpha = Math.min(1, state.bannerTimer);
-    context.globalAlpha = alpha;
-    context.textBaseline = 'alphabetic';
-    text(state.banner, FIELD.width / 2, 190, 52, PALETTE.text, 'center', true);
-    if (state.bannerSub) text(state.bannerSub, FIELD.width / 2, 228, 22, PALETTE.muted, 'center');
-    context.globalAlpha = 1;
-  }
-
-  function drawPanel(title, lines, prompt) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.strokeStyle = PALETTE.panelEdge;
-    context.lineWidth = 2;
-    context.strokeRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 48, PALETTE.text, 'center', true);
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 22, PALETTE.muted, 'center');
-    }
-    text(prompt, FIELD.width / 2, y + height - 38, 24, PALETTE.cardPick, 'center');
-  }
-
-  const TITLE_LINES = [
-    'The moths come for the last lantern.',
-    'Hold the light through 10 waves.',
-    'Move with WASD or arrows. Aim with the mouse.',
-    'Hold click to throw embers. Pick an upgrade',
-    'between waves — then face the Moth Queen.',
-    '',
-  ];
-  const PAUSED_LINES = ['The night waits for you.'];
-  const OVER_LINES = ['', '', '', ''];
-  const WIN_LINES = ['', '', '', ''];
-
-  /** The three upgrade cards, in field coordinates, for click hit-testing. */
-  function upgradeRects() {
-    const total = 3 * CARDS.width + 2 * CARDS.gap;
-    const startX = (FIELD.width - total) / 2;
-    const rects = [];
-    for (let index = 0; index < 3; index += 1) {
-      rects.push({
-        x: startX + index * (CARDS.width + CARDS.gap),
-        y: CARDS.top,
-        width: CARDS.width,
-        height: CARDS.height,
-      });
-    }
-    return rects;
-  }
-
-  function drawUpgrade(state, best) {
-    context.textBaseline = 'alphabetic';
-    text(`Wave ${state.wave} cleared!`, FIELD.width / 2, 150, 44, PALETTE.text, 'center', true);
-    text('Choose an upgrade — click a card, or press 1, 2 or 3.', FIELD.width / 2, 196, 22, PALETTE.muted, 'center');
-    const rects = upgradeRects();
-    for (let index = 0; index < 3; index += 1) {
-      const upgrade = state.offered[index];
-      const rect = rects[index];
-      if (!upgrade) continue;
-      context.fillStyle = PALETTE.card;
-      context.fillRect(rect.x, rect.y, rect.width, rect.height);
-      context.strokeStyle = PALETTE.cardEdge;
-      context.lineWidth = 2;
-      context.strokeRect(rect.x, rect.y, rect.width, rect.height);
-      text(`${index + 1}`, rect.x + 18, rect.y + 16, 20, PALETTE.muted, 'left', true);
-      text(upgrade.name, rect.x + rect.width / 2, rect.y + 66, 26, PALETTE.text, 'center', true);
-      // Word-wrap the blurb across the card.
-      context.font = `19px ${FONT}`;
-      const words = upgrade.blurb.split(' ');
-      let line = '';
-      let lineY = rect.y + 116;
-      for (let word = 0; word < words.length; word += 1) {
-        const test = line === '' ? words[word] : `${line} ${words[word]}`;
-        if (context.measureText(test).width > rect.width - 48 && line !== '') {
-          text(line, rect.x + rect.width / 2, lineY, 19, PALETTE.muted, 'center');
-          line = words[word];
-          lineY += 26;
-        } else {
-          line = test;
-        }
-      }
-      if (line !== '') text(line, rect.x + rect.width / 2, lineY, 19, PALETTE.muted, 'center');
-      const taken = state.taken[upgrade.id] ?? 0;
-      if (taken > 0) text(`Owned x${taken}`, rect.x + rect.width / 2, rect.y + rect.height - 30, 16, PALETTE.cardPick, 'center');
-    }
-  }
-
-  /** Paint one frame: the garden, the creatures, the HUD, then the screen's panel. */
-  function draw(state, screen, best, muted) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.skyTop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    const shakeX = state.shake > 0 ? (Math.random() - 0.5) * state.shake * 18 : 0;
-    const shakeY = state.shake > 0 ? (Math.random() - 0.5) * state.shake * 18 : 0;
-    context.setTransform(view.scale, 0, 0, view.scale, view.x + shakeX * view.scale, view.y + shakeY * view.scale);
-    drawGarden(state);
-    drawLantern(state);
-    // Shards under the creatures.
-    for (let index = 0; index < state.shards.length; index += 1) {
-      const shard = state.shards[index];
-      if (!shard.active) continue;
+      context.moveTo(bolt.x - bolt.vx * 0.035, bolt.y - bolt.vy * 0.035);
+      context.lineTo(bolt.x, bolt.y);
+      context.stroke();
+      context.globalAlpha = 1;
       context.save();
-      context.translate(shard.x, shard.y);
-      context.rotate(state.time * 3 + index);
-      context.fillStyle = PALETTE.shard;
-      context.fillRect(-4, -4, 8, 8);
+      context.translate(bolt.x, bolt.y);
+      context.rotate(angle);
+      context.fillStyle = bolt.crit ? PALETTE.gold : PALETTE.bolt;
+      context.beginPath();
+      context.ellipse(0, 0, 13, 5, 0, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = PALETTE.boltCore;
+      context.beginPath();
+      context.ellipse(2, 0, 7, 2.5, 0, 0, Math.PI * 2);
+      context.fill();
       context.restore();
     }
-    for (let index = 0; index < state.enemies.length; index += 1) {
-      const enemy = state.enemies[index];
+    for (const wisp of state.wisps) {
+      if (!wisp.active) continue;
+      const glow = context.createRadialGradient(wisp.x, wisp.y, 1, wisp.x, wisp.y, 16);
+      glow.addColorStop(0, 'rgba(199, 146, 255, 0.8)');
+      glow.addColorStop(1, 'rgba(199, 146, 255, 0)');
+      context.fillStyle = glow;
+      context.beginPath();
+      context.arc(wisp.x, wisp.y, 16, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = PALETTE.wisp;
+      context.beginPath();
+      context.arc(wisp.x, wisp.y, wisp.radius, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = '#faf5ff';
+      context.beginPath();
+      context.arc(wisp.x, wisp.y, 3, 0, Math.PI * 2);
+      context.fill();
+    }
+    for (const glob of state.enemyShots) {
+      if (!glob.active) continue;
+      context.fillStyle = PALETTE.glob;
+      context.beginPath();
+      context.arc(glob.x, glob.y, glob.radius, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = PALETTE.globCore;
+      context.beginPath();
+      context.arc(glob.x - 2, glob.y - 2, glob.radius * 0.45, 0, Math.PI * 2);
+      context.fill();
+    }
+    for (const orb of orbitalPositions(state)) {
+      const glow = context.createRadialGradient(orb.x, orb.y, 1, orb.x, orb.y, 22);
+      glow.addColorStop(0, 'rgba(125, 232, 255, 0.7)');
+      glow.addColorStop(1, 'rgba(125, 232, 255, 0)');
+      context.fillStyle = glow;
+      context.beginPath();
+      context.arc(orb.x, orb.y, 22, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = PALETTE.beaconGlow;
+      context.beginPath();
+      context.arc(orb.x, orb.y, orb.radius, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = PALETTE.beaconCore;
+      context.beginPath();
+      context.arc(orb.x, orb.y, 5, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+
+  function drawHud(state, screen, best, remaining) {
+    const time = state.time;
+    context.textAlign = 'left';
+    context.font = `800 26px ${FONT}`;
+    context.fillStyle = PALETTE.text;
+    context.fillText(state.score.toLocaleString(), 24, 38);
+    context.font = `400 14px ${FONT}`;
+    context.fillStyle = PALETTE.muted;
+    context.fillText(`BEST ${Math.max(best, state.score).toLocaleString()}`, 24, 58);
+    const multiplier = comboMultiplier(state.combo.kills);
+    if (multiplier > 1 && state.combo.timer > 0) {
+      context.font = `800 20px ${FONT}`;
+      context.fillStyle = PALETTE.gold;
+      context.fillText(`COMBO x${multiplier}`, 24, 86);
+    }
+
+    // Tide, foes and the beacon's light, centred at the top.
+    context.textAlign = 'center';
+    context.font = `800 20px ${FONT}`;
+    context.fillStyle = PALETTE.text;
+    const tideLabel = state.tide === 0 ? 'THE REEF' : state.tide === TIDE_COUNT ? 'THE MAW' : `TIDE ${state.tide} / ${TIDE_COUNT}`;
+    context.fillText(tideLabel, FIELD.width / 2, 32);
+    context.font = `400 14px ${FONT}`;
+    context.fillStyle = PALETTE.muted;
+    const foesLine = state.phase === 'done' ? '' : state.phase === 'breather' ? 'the water calms…' : `${remaining} foes remain`;
+    context.fillText(foesLine, FIELD.width / 2, 52);
+    const barWidth = 260;
+    const barX = FIELD.width / 2 - barWidth / 2;
+    const hpFraction = Math.max(0, state.beacon.hp / state.beacon.maxHp);
+    context.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    context.fillRect(barX, 62, barWidth, 10);
+    context.fillStyle = hpFraction > 0.5 ? PALETTE.beaconGlow : hpFraction > 0.25 ? PALETTE.gold : PALETTE.danger;
+    context.fillRect(barX, 62, barWidth * hpFraction, 10);
+    context.font = `700 12px ${FONT}`;
+    context.fillStyle = PALETTE.muted;
+    context.fillText(`BEACON ${Math.ceil(state.beacon.hp)} / ${state.beacon.maxHp}`, FIELD.width / 2, 88);
+
+    // The Maw's bar, under the beacon's.
+    const boss = state.boss;
+    if (boss !== null && boss.active) {
+      const bossWidth = 420;
+      const bossX = FIELD.width / 2 - bossWidth / 2;
+      const bossFraction = Math.max(0, boss.hp / boss.maxHp);
+      context.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      context.fillRect(bossX, 100, bossWidth, 12);
+      context.fillStyle = PALETTE.maw;
+      context.fillRect(bossX, 100, bossWidth * bossFraction, 12);
+      context.font = `800 13px ${FONT}`;
+      context.fillStyle = '#fecdd3';
+      context.fillText('THE MAW OF THE DEEP', FIELD.width / 2, 128);
+    }
+
+    // Hearts and ward, bottom left.
+    for (let index = 0; index < state.player.maxHp; index += 1) {
+      const x = 34 + index * 30;
+      const y = FIELD.height - 40;
+      if (index < state.player.hp) {
+        drawHeartShape(x, y, 11, PALETTE.heart);
+      } else {
+        context.globalAlpha = 0.25;
+        drawHeartShape(x, y, 11, PALETTE.heart);
+        context.globalAlpha = 1;
+      }
+    }
+    if (state.player.shield > 0) {
+      context.font = `700 15px ${FONT}`;
+      context.fillStyle = PALETTE.shield;
+      context.textAlign = 'left';
+      context.fillText(`WARD ${state.player.shield}`, 34 + state.player.maxHp * 30 + 8, FIELD.height - 32);
+    }
+
+    // Dash, bottom centre.
+    const dashReady = state.player.dashCd <= 0;
+    const dashFraction = dashReady ? 1 : 1 - state.player.dashCd / state.build.dashCooldown;
+    context.textAlign = 'center';
+    context.font = `700 13px ${FONT}`;
+    context.fillStyle = dashReady ? PALETTE.player : PALETTE.muted;
+    context.fillText('DASH [SHIFT]', FIELD.width / 2, FIELD.height - 48);
+    context.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    context.fillRect(FIELD.width / 2 - 60, FIELD.height - 40, 120, 8);
+    context.fillStyle = PALETTE.player;
+    context.fillRect(FIELD.width / 2 - 60, FIELD.height - 40, 120 * dashFraction, 8);
+
+    // Level and experience, bottom right.
+    const xpFraction = Math.min(1, state.xp / state.xpNext);
+    context.textAlign = 'right';
+    context.font = `800 18px ${FONT}`;
+    context.fillStyle = PALETTE.text;
+    context.fillText(`LEVEL ${state.level}`, FIELD.width - 24, FIELD.height - 48);
+    context.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    context.fillRect(FIELD.width - 224, FIELD.height - 40, 200, 8);
+    context.fillStyle = PALETTE.xpBar;
+    context.fillRect(FIELD.width - 224, FIELD.height - 40, 200 * xpFraction, 8);
+    context.font = `400 12px ${FONT}`;
+    context.fillStyle = PALETTE.muted;
+    context.fillText(`${Math.floor(state.xp)} / ${state.xpNext} lumens`, FIELD.width - 24, FIELD.height - 22);
+
+    // The tide banner, fading in the middle of the water.
+    if (state.banner.timer > 0 && screen === 'playing') {
+      const alpha = Math.min(1, state.banner.timer / 0.6);
+      context.globalAlpha = alpha;
+      context.textAlign = 'center';
+      context.font = `800 44px ${FONT}`;
+      context.fillStyle = PALETTE.beaconGlow;
+      context.fillText(state.banner.text, FIELD.width / 2, 190);
+      context.font = `400 19px ${FONT}`;
+      context.fillStyle = PALETTE.text;
+      context.fillText(state.banner.sub, FIELD.width / 2, 222);
+      context.globalAlpha = 1;
+    }
+
+    // Danger vignette when the keeper or the beacon is nearly spent.
+    const danger = state.player.hp <= 1 || state.beacon.hp < 25;
+    if (danger && screen === 'playing') {
+      const pulse = 0.22 + Math.sin(time * 4) * 0.1;
+      const vignette = context.createRadialGradient(FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.32, FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.72);
+      vignette.addColorStop(0, 'rgba(225, 29, 72, 0)');
+      vignette.addColorStop(1, `rgba(225, 29, 72, ${pulse})`);
+      context.fillStyle = vignette;
+      context.fillRect(0, 0, FIELD.width, FIELD.height);
+    }
+  }
+
+  /** Draw one frame: the world, the HUD, then whichever screen is showing. */
+  function draw(state, screen, ui) {
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = '#020a12';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.setTransform(deviceScale * scale, 0, 0, deviceScale * scale, deviceScale * offsetX, deviceScale * offsetY);
+
+    const shake = ui.shakeOn ? state.particles.offset() : { x: 0, y: 0 };
+    context.save();
+    context.translate(shake.x, shake.y);
+    drawBackground(state.time);
+    drawBeacon(state, state.time);
+    drawShards(state, state.time);
+    drawPickups(state, state.time);
+    drawMines(state, state.time);
+    for (const enemy of state.enemies) {
       if (enemy.active) drawEnemy(enemy, state.time);
     }
-    if (screen !== SCREEN_TITLE) drawPlayer(state, state.time);
-    for (let index = 0; index < state.projectiles.length; index += 1) {
-      const shot = state.projectiles[index];
-      if (!shot.active) continue;
-      const glow = context.createRadialGradient(shot.x, shot.y, 1, shot.x, shot.y, 14);
-      glow.addColorStop(0, 'rgba(255, 209, 102, 0.9)');
-      glow.addColorStop(1, 'rgba(255, 122, 60, 0)');
-      context.fillStyle = glow;
-      context.fillRect(shot.x - 14, shot.y - 14, 28, 28);
-      circle(shot.x, shot.y, PLAYER.emberRadius, PALETTE.ember);
-      circle(shot.x, shot.y, 2.5, PALETTE.emberCore);
-    }
-    // Particles.
-    for (let index = 0; index < state.particles.parts.length; index += 1) {
-      const part = state.particles.parts[index];
-      if (!part.active) continue;
-      context.globalAlpha = Math.max(0, part.life / part.maxLife);
-      circle(part.x, part.y, part.size, part.color);
-    }
-    context.globalAlpha = 1;
-    // Floating texts.
-    context.textBaseline = 'alphabetic';
-    for (let index = 0; index < state.particles.texts.length; index += 1) {
-      const floatText = state.particles.texts[index];
-      if (!floatText.active) continue;
-      context.globalAlpha = Math.min(1, floatText.life / 0.6);
-      text(floatText.value, floatText.x, floatText.y, floatText.size, floatText.color, 'center', true);
-    }
-    context.globalAlpha = 1;
+    drawBoss(state, state.time);
+    drawPlayer(state, state.time);
+    drawProjectiles(state);
+    state.particles.draw(context);
+    state.particles.drawTexts(context, FONT);
+    context.restore();
 
-    if (screen === SCREEN_TITLE) {
-      TITLE_LINES[5] = best > 0 ? bestLabel(best) : 'No keeper has held the light yet.';
-      drawPanel('EMBERFALL', TITLE_LINES, 'Click or press Space to begin');
-      return;
+    if (screen !== SCREEN_TITLE) {
+      drawHud(state, screen, ui.best, ui.remaining);
     }
-    drawHud(state, best, muted);
-    drawBanner(state);
-    if (screen === SCREEN_PAUSED) {
-      drawPanel('Paused', PAUSED_LINES, 'Press P to keep playing');
-    } else if (screen === SCREEN_UPGRADE) {
-      drawUpgrade(state, best);
-    } else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      OVER_LINES[2] = `${killsLabel(state.kills)}  ·  ${shardsLabel(state.shardsCollected)}`;
-      OVER_LINES[3] = `Waves survived ${Math.max(0, state.wave - 1)} of ${TOTAL_WAVES}`;
-      drawPanel(state.lantern.hp <= 0 ? 'The light went out' : 'The keeper has fallen', OVER_LINES, 'Click or press Space to try again');
-    } else if (screen === SCREEN_WIN) {
-      WIN_LINES[0] = finalLabel(state.score);
-      WIN_LINES[1] = bestLabel(best);
-      WIN_LINES[2] = `${killsLabel(state.kills)}  ·  ${shardsLabel(state.shardsCollected)}`;
-      WIN_LINES[3] = `All ${TOTAL_WAVES} waves held — dawn breaks`;
-      drawPanel('Dawn breaks!', WIN_LINES, 'Click or press Space to play again');
-    }
+    if (screen === SCREEN_TITLE) drawTitle(context, ui.best, ui.muted, ui.shakeOn, state.time);
+    else if (screen === SCREEN_UPGRADE) drawUpgrade(context, state);
+    else if (screen === SCREEN_PAUSED) drawPaused(context, ui.muted, ui.shakeOn);
+    else if (screen === SCREEN_OVER) drawOver(context, state, ui.best, ui.reason);
+    else if (screen === SCREEN_WIN) drawWin(context, state, ui.best);
   }
 
   resize();
   window.addEventListener('resize', resize);
-  return {
-    draw,
-    upgradeRects,
-    /** Convert a point inside the canvas element to field coordinates. */
-    toField(clientX, clientY, rectWidth, rectHeight) {
-      const scale = Math.min(rectWidth / FIELD.width, rectHeight / FIELD.height);
-      const offsetX = (rectWidth - FIELD.width * scale) / 2;
-      const offsetY = (rectHeight - FIELD.height * scale) / 2;
-      return { x: (clientX - offsetX) / scale, y: (clientY - offsetY) / scale };
-    },
-  };
+  return { draw, resize, toField, upgradeRects, pauseRects };
 }

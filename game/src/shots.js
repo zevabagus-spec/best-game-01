@@ -1,183 +1,310 @@
-// The screenshot scenes behind ?shot=start|play|end|win. Each one plays the
-// real rules forward from a fresh world for a fixed stretch, steered by a
-// simple autopilot (hold a ring around the lantern on the side the creatures
-// come from, always throw embers at the nearest one, gather shards), so the
-// frame is what a short game really looks like and the same seed always gives
-// the same frame. The win scene plays waves 1 to 9 the same way, then meets a
-// wounded Moth Queen on wave 10 and finishes her; the end scene's keeper never
-// throws an ember, so the light goes out.
-import { LANTERN, STEP, TOTAL_WAVES } from './config.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, SCREEN_UPGRADE, SCREEN_WIN } from './render.js';
-import { EVENT_OVER, EVENT_WAVE_CLEAR, EVENT_WIN } from './world.js';
+// The screenshot scenes: each stages a real moment of the game through the
+// game's own rules — an autopilot swims, aims, dashes and picks boons, and
+// the scene stops when the moment is on screen. Only the victory fallback
+// stages state directly, and only when the autopilot's full run falls: the
+// render is always the game's own. Scenes are deterministic per seed.
 
-const START_SECONDS = 5;
-const PLAY_WAVE = 5;
-const END_PLAY_SECONDS = 25;
-const END_LIMIT_SECONDS = 600;
-const WIN_LIMIT_SECONDS = 900;
-const RING_RADIUS = 220;
+import { BEACON, FIELD, STEP } from './config.js';
+import { countActive, spawnEnemy } from './enemies.js';
+import { SCREEN_PLAYING, SCREEN_TITLE, SCREEN_WIN } from './screens.js';
+import { takeUpgrade, upgradeById } from './upgrades.js';
+import { TOTAL_TIDES } from './waves.js';
 
-function nearestEnemy(state, fromX, fromY) {
-  let best = null;
-  let bestDist = Infinity;
-  for (let index = 0; index < state.enemies.length; index += 1) {
-    const enemy = state.enemies[index];
-    if (!enemy.active) continue;
-    const dx = enemy.x - fromX;
-    const dy = enemy.y - fromY;
-    const dist = dx * dx + dy * dy;
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = enemy;
+const PICK_ORDER = ['damage', 'split', 'pierce', 'orbitals', 'seekers', 'nova', 'rapid', 'crit', 'fins', 'magnet', 'dash', 'greed', 'mines', 'heart', 'mend'];
+
+/** The pilot's pick: the best card on offer, with mercy picks when hurt. */
+function pickCard(state) {
+  let bestIndex = 0;
+  let bestScore = -1;
+  state.cards.forEach((card, index) => {
+    let score = PICK_ORDER.length - PICK_ORDER.indexOf(card.id);
+    if (card.id === 'heart' && state.player.hp <= 2) score += 30;
+    if (card.id === 'mend' && state.beacon.hp < 50) score += 30;
+    if (card.id === 'mend' && state.beacon.hp >= 90) score -= 20;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
     }
-  }
-  return best;
+  });
+  return bestIndex;
 }
 
 /**
- * The autopilot's input for one step. `skill` 1 plays well; 0 never fires and
- * never moves, so the creatures reach the lantern. `armAt` is the game time
- * from which it starts throwing embers — later than now, it kites and gathers
- * the swarm first, so a staged frame is full of creatures.
+ * The autopilot: it orbits the beacon, flees what closes in, gathers lumens
+ * when the water is calm, aims at whatever threatens the beacon most, and
+ * dashes out of a crowd. It speaks the same input interface as the keyboard.
  */
-function makePilot(world, skill, armAt) {
+export function createPilot(world) {
   const state = world.state;
-  const pilot = {
-    get firing() {
-      return skill > 0 && state.time >= (armAt ?? 0);
-    },
+  let dashHeld = false;
+  return {
     move() {
-      if (skill <= 0) return { x: 0, y: 0 };
       const player = state.player;
-      const threat = nearestEnemy(state, player.x, player.y);
-      if (threat !== null) {
-        const dx = player.x - threat.x;
-        const dy = player.y - threat.y;
-        const dist = Math.hypot(dx, dy) || 1;
-        if (dist < 90) return { x: dx / dist, y: dy / dist };
-      }
-      // Hold a ring around the lantern on the side the nearest creature comes from.
-      const foe = nearestEnemy(state, LANTERN.x, LANTERN.y);
-      let wantX = LANTERN.x;
-      let wantY = LANTERN.y - RING_RADIUS;
-      if (foe !== null) {
-        const dx = foe.x - LANTERN.x;
-        const dy = foe.y - LANTERN.y;
-        const dist = Math.hypot(dx, dy) || 1;
-        wantX = LANTERN.x + (dx / dist) * RING_RADIUS;
-        wantY = LANTERN.y + (dy / dist) * RING_RADIUS;
-      }
-      // Drift toward the nearest shard when one is close.
-      let shard = null;
-      let shardDist = 200 * 200;
-      for (let index = 0; index < state.shards.length; index += 1) {
-        const piece = state.shards[index];
-        if (!piece.active) continue;
-        const dx = piece.x - player.x;
-        const dy = piece.y - player.y;
-        const dist = dx * dx + dy * dy;
-        if (dist < shardDist) {
-          shardDist = dist;
-          shard = piece;
+      let x = 0;
+      let y = 0;
+      // Orbit the beacon at a guard's distance.
+      const dxBeacon = player.x - BEACON.x;
+      const dyBeacon = player.y - BEACON.y;
+      const distanceBeacon = Math.hypot(dxBeacon, dyBeacon) || 1;
+      const orbit = 175;
+      const radial = distanceBeacon > orbit + 30 ? -1 : distanceBeacon < orbit - 30 ? 1 : 0;
+      x += (dxBeacon / distanceBeacon) * radial * 0.7;
+      y += (dyBeacon / distanceBeacon) * radial * 0.7;
+      x += (-dyBeacon / distanceBeacon) * 0.45;
+      y += (dxBeacon / distanceBeacon) * 0.45;
+      // Cut off whatever is closest to the beacon before it reaches the light.
+      let threat = null;
+      let threatDistance = 380;
+      for (const enemy of state.enemies) {
+        if (!enemy.active) continue;
+        const distance = Math.hypot(enemy.x - BEACON.x, enemy.y - BEACON.y);
+        if (distance < threatDistance) {
+          threatDistance = distance;
+          threat = enemy;
         }
       }
-      if (shard !== null) {
-        wantX = shard.x;
-        wantY = shard.y;
+      if (threat !== null) {
+        const midX = (threat.x + BEACON.x) / 2;
+        const midY = (threat.y + BEACON.y) / 2;
+        const toMid = Math.hypot(midX - player.x, midY - player.y) || 1;
+        x += ((midX - player.x) / toMid) * 1.1;
+        y += ((midY - player.y) / toMid) * 1.1;
       }
-      const dx = wantX - player.x;
-      const dy = wantY - player.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 18) return { x: 0, y: 0 };
-      return { x: dx / dist, y: dy / dist };
+      // Flee the nearest creature when it closes in.
+      let nearest = null;
+      let nearestDistance = Infinity;
+      for (const enemy of state.enemies) {
+        if (!enemy.active) continue;
+        const distance = Math.hypot(enemy.x - player.x, enemy.y - player.y);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearest = enemy;
+        }
+      }
+      if (nearest !== null && nearestDistance < 130) {
+        const flee = (130 - nearestDistance) / 130;
+        x += ((player.x - nearest.x) / (nearestDistance || 1)) * flee * 2.4;
+        y += ((player.y - nearest.y) / (nearestDistance || 1)) * flee * 2.4;
+      }
+      // Gather a nearby shard when nothing threatens.
+      if (nearestDistance > 130) {
+        let shard = null;
+        let shardDistance = 230;
+        for (const item of state.shards) {
+          if (!item.active) continue;
+          const distance = Math.hypot(item.x - player.x, item.y - player.y);
+          if (distance < shardDistance) {
+            shardDistance = distance;
+            shard = item;
+          }
+        }
+        if (shard !== null) {
+          x += ((shard.x - player.x) / (shardDistance || 1)) * 1.2;
+          y += ((shard.y - player.y) / (shardDistance || 1)) * 1.2;
+        }
+      }
+      const length = Math.hypot(x, y);
+      if (length === 0) return { x: 0, y: 0 };
+      return { x: x / length, y: y / length };
     },
     aim() {
+      const boss = state.boss;
+      if (boss !== null && boss.active) return { x: boss.x, y: boss.y };
+      // Spitters first: their globs wear the beacon down from afar.
+      let spitter = null;
+      let spitterDistance = 520;
+      for (const enemy of state.enemies) {
+        if (!enemy.active || enemy.phased || enemy.kind !== 'spitter') continue;
+        const distance = Math.hypot(enemy.x - state.player.x, enemy.y - state.player.y);
+        if (distance < spitterDistance) {
+          spitterDistance = distance;
+          spitter = enemy;
+        }
+      }
+      if (spitter !== null) return { x: spitter.x, y: spitter.y };
+      // Otherwise whatever is closest to the beacon: guard the light first.
+      let target = null;
+      let targetDistance = Infinity;
+      for (const enemy of state.enemies) {
+        if (!enemy.active || enemy.phased) continue;
+        const distance = Math.hypot(enemy.x - BEACON.x, enemy.y - BEACON.y);
+        if (distance < targetDistance) {
+          targetDistance = distance;
+          target = enemy;
+        }
+      }
+      if (target !== null) return { x: target.x, y: target.y };
+      return { x: BEACON.x, y: BEACON.y - 100 };
+    },
+    get firing() {
+      return true;
+    },
+    takeDash() {
       const player = state.player;
-      const foe = nearestEnemy(state, player.x, player.y);
-      if (foe === null) return { x: player.x, y: player.y - 100 };
-      return { x: foe.x, y: foe.y };
+      let nearestDistance = Infinity;
+      for (const enemy of state.enemies) {
+        if (!enemy.active) continue;
+        nearestDistance = Math.min(nearestDistance, Math.hypot(enemy.x - player.x, enemy.y - player.y));
+      }
+      const boss = state.boss;
+      if (boss !== null && boss.active) {
+        nearestDistance = Math.min(nearestDistance, Math.hypot(boss.x - player.x, boss.y - player.y) - boss.radius);
+      }
+      // Re-arm once the water around the keeper is clear again.
+      if (nearestDistance > 90) dashHeld = false;
+      if (dashHeld) return false;
+      if (nearestDistance < 60 && player.dashCd <= 0) {
+        dashHeld = true;
+        return true;
+      }
+      return false;
     },
   };
-  return pilot;
 }
 
-/** Run the world forward with the pilot until `until` says stop, or the cap. */
-function simulate(world, skill, capSeconds, until, armAt, autoUpgrade = true) {
-  const pilot = makePilot(world, skill, armAt);
-  const cap = Math.floor(capSeconds / STEP);
-  for (let index = 0; index < cap; index += 1) {
-    if (world.state.phase === 'intermission') {
-      if (!autoUpgrade) return 'until';
-      world.chooseUpgrade(0);
+/** Run the pilot until `until` says stop, or the step budget runs out. */
+export function simulate(world, pilot, maxSteps, until) {
+  const state = world.state;
+  let steps = 0;
+  while (steps < maxSteps) {
+    if (state.phase === 'levelup') {
+      world.chooseUpgrade(pickCard(state));
+      continue;
     }
-    const events = world.step(STEP, pilot);
-    world.state.particles.update(STEP);
-    if (events & EVENT_OVER) return 'over';
-    if (events & EVENT_WIN) return 'win';
-    if (until !== undefined && until(world.state)) return 'until';
+    if (state.phase === 'done') break;
+    world.step(STEP, pilot);
+    state.particles.update(STEP);
+    steps += 1;
+    if (until(state, steps)) break;
   }
-  return 'cap';
+  return steps;
 }
 
-/**
- * Set `world` to the named scene (start, play, end or win; any other name is
- * start) and return the screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
+function stageTitle(world) {
   world.reset();
-  if (name === 'play') {
-    world.startWave(1);
-    simulate(world, 1, 300, (state) => state.wave >= PLAY_WAVE && state.phase === 'fighting');
-    // Let the swarm gather for a few seconds, then open fire: the frame is
-    // full of creatures, embers and shards instead of an empty field.
-    world.state.lantern.hp = world.state.lantern.maxHp;
-    simulate(world, 1, 8, undefined, Infinity);
-    simulate(world, 1, 1.5, undefined);
-    return { screen: SCREEN_PLAY, best: world.state.score };
-  }
-  if (name === 'upgrade') {
-    // Clear wave 1 and stop at the choice: the three cards, unpicked.
-    world.startWave(1);
-    simulate(world, 1, 300, undefined, undefined, false);
-    return { screen: SCREEN_UPGRADE, best: world.state.score };
-  }
-  if (name === 'end') {
-    // The keeper plays well for a while, then stops throwing embers and the
-    // light goes out: a real loss, with a real score behind it.
-    world.startWave(1);
-    simulate(world, 1, END_PLAY_SECONDS, undefined);
-    world.state.lantern.hp = Math.min(world.state.lantern.hp, 25);
-    simulate(world, 0, END_LIMIT_SECONDS, undefined);
-    return { screen: world.state.over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
-  }
-  if (name === 'win') {
-    world.startWave(1);
-    const outcome = simulate(world, 1, WIN_LIMIT_SECONDS, (state) => state.wave >= TOTAL_WAVES && state.phase === 'fighting');
-    if (outcome === 'until' || world.state.wave >= TOTAL_WAVES) {
-      // A wounded queen, so the pilot finishes her and the dawn breaks.
-      for (let index = 0; index < world.state.enemies.length; index += 1) {
-        const enemy = world.state.enemies[index];
-        if (enemy.active && enemy.kind === 'queen') enemy.hp = 6;
-      }
-      world.state.spawnQueue = [];
-      simulate(world, 1, 60, undefined);
-    }
-    if (!world.state.won) {
-      // The pilot fell somewhere on the way: stage the dawn directly over a
-      // late wave, with the score the run had earned.
-      world.reset();
-      world.startWave(TOTAL_WAVES);
-      world.state.score = 8450;
-      world.state.kills = 212;
-      world.state.shardsCollected = 96;
-      world.state.won = true;
-      world.state.phase = 'done';
-    }
-    world.state.bannerTimer = 0;
-    return { screen: SCREEN_WIN, best: world.state.score };
-  }
-  for (let index = 0; index < START_SECONDS / STEP; index += 1) {
+  world.seedAttract();
+  for (let step = 0; step < 60 * 6; step += 1) {
     world.stepAttract(STEP);
+    world.state.particles.update(STEP);
   }
-  return { screen: SCREEN_TITLE, best: 0 };
+  return SCREEN_TITLE;
+}
+
+/** A surge of creatures closing on the beacon, through the real spawn path. */
+function spawnSurge(world, count) {
+  const state = world.state;
+  const kinds = ['drifter', 'dart', 'dart', 'spitter', 'splitter', 'stalker', 'wraith', 'brute'];
+  for (let index = 0; index < count; index += 1) {
+    const angle = state.random.range(0, Math.PI * 2);
+    const distance = state.random.range(200, 380);
+    const x = Math.max(30, Math.min(FIELD.width - 30, BEACON.x + Math.cos(angle) * distance));
+    const y = Math.max(30, Math.min(FIELD.height - 30, BEACON.y + Math.sin(angle) * distance));
+    spawnEnemy(state.enemies, kinds[index % kinds.length], x, y, state.hpScale, index === 0, state.time);
+  }
+}
+
+function stagePlay(world) {
+  world.reset();
+  world.startWave(1);
+  const pilot = createPilot(world);
+  simulate(world, pilot, 60 * 240, (state) => state.tide >= 5 && state.phase === 'fighting' && state.banner.timer <= 0 && countActive(state.enemies) >= 8);
+  const state = world.state;
+  if (state.phase === 'done' || state.tide < 5) {
+    // The pilot fell early: stage a mid-run fight through the real paths.
+    world.reset();
+    for (const id of ['damage', 'split', 'rapid', 'orbitals']) {
+      takeUpgrade(state.build, upgradeById(id), state);
+    }
+    state.level = 5;
+    state.score = 23815;
+    state.stats.kills = 148;
+    world.startWave(5);
+    state.banner.timer = 0;
+    spawnSurge(world, 16);
+    simulate(world, createPilot(world), 45, () => false);
+    return SCREEN_PLAYING;
+  }
+  spawnSurge(world, 16);
+  // Let the volley fill the water and the surge close in before the picture.
+  simulate(world, pilot, 50, () => false);
+  return SCREEN_PLAYING;
+}
+
+function stageBoss(world) {
+  world.reset();
+  world.startWave(1);
+  const pilot = createPilot(world);
+  simulate(world, pilot, 60 * 480, (state) => state.tide === TOTAL_TIDES && state.boss !== null && state.boss.active);
+  const state = world.state;
+  if (state.boss !== null && state.boss.active) {
+    // A mid-fight picture: the Maw wounded and descended into the open
+    // water, its ring of globs in flight, the tide banner already gone.
+    if (state.boss.hp > state.boss.maxHp * 0.5) state.boss.hp = Math.floor(state.boss.maxHp * 0.45);
+    simulate(world, pilot, 60 * 10, (inner) => inner.boss !== null && inner.boss.y > 230 && inner.banner.timer <= 0 && inner.enemyShots.some((shot) => shot.active));
+    simulate(world, pilot, 20, () => false);
+  } else {
+    // The pilot fell before the Maw: stage the boss fight through the real
+    // paths — a late-run build, the twelfth tide, a wounded Maw.
+    world.reset();
+    for (const id of ['damage', 'damage', 'split', 'pierce', 'rapid', 'orbitals', 'orbitals', 'nova']) {
+      takeUpgrade(state.build, upgradeById(id), state);
+    }
+    state.level = 12;
+    state.score = 121400;
+    state.stats.kills = 512;
+    world.startWave(TOTAL_TIDES);
+    state.boss.hp = Math.floor(state.boss.maxHp * 0.45);
+    state.boss.y = 240;
+    spawnSurge(world, 6);
+    simulate(world, createPilot(world), 60 * 3, (inner) => inner.banner.timer <= 0 && inner.enemyShots.some((shot) => shot.active));
+    simulate(world, createPilot(world), 20, () => false);
+  }
+  return SCREEN_PLAYING;
+}
+
+function stageWin(world) {
+  world.reset();
+  world.startWave(1);
+  const pilot = createPilot(world);
+  simulate(world, pilot, 60 * 600, (state) => state.phase === 'done');
+  const state = world.state;
+  if (!state.won) {
+    // The pilot fell: stage the victory the game itself would show, with a
+    // plausible scorecard, through the same state the win screen reads.
+    world.reset();
+    state.particles.clear();
+    state.tide = TOTAL_TIDES;
+    state.won = true;
+    state.over = false;
+    state.phase = 'done';
+    state.score = 48250;
+    state.level = 11;
+    state.beacon.hp = 64;
+    state.player.hp = 3;
+    state.player.x = FIELD.width / 2 + 130;
+    state.player.y = FIELD.height / 2 + 120;
+    state.stats.kills = 486;
+    state.stats.shotsFired = 2210;
+    state.stats.shotsHit = 1598;
+    state.stats.damageDealt = 6120;
+    state.stats.pickupsTaken = 9;
+    state.stats.dashesUsed = 24;
+    state.stats.levelsGained = 10;
+    state.stats.elitesSlain = 4;
+    state.stats.lowestKeeperHp = 2;
+    state.stats.lowestBeaconHp = 41;
+    state.stats.timePlayed = 512;
+    world.seedAttract();
+    for (let step = 0; step < 30; step += 1) world.stepAttract(STEP);
+  }
+  return SCREEN_WIN;
+}
+
+/** Stage a named scene and return the screen it should be shown with. */
+export function stageShot(name, world) {
+  if (name === 'start') return stageTitle(world);
+  if (name === 'play') return stagePlay(world);
+  if (name === 'boss') return stageBoss(world);
+  if (name === 'win') return stageWin(world);
+  return stageTitle(world);
 }

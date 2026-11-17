@@ -1,587 +1,462 @@
-// The game's rules and state, with no drawing and no browser in it: the keeper,
-// the lantern, the pools of creatures, embers and shards, the waves, the combo
-// and the score. step() advances one fixed step and returns what happened as
-// bit flags, so the caller can react (sounds, banners) without the world
-// knowing about screens or sound. Nothing here allocates after createWorld
-// returns, except the short spawn queue a wave builds.
-import {
-  COMBO,
-  ENEMY,
-  FIELD,
-  LANTERN,
-  PLAYER,
-  POOLS,
-  SHARD,
-  TOTAL_WAVES,
-  WAVES,
-  WAVE_CLEAR_BONUS,
-} from './config.js';
-import { drawUpgrades } from './upgrades.js';
+// The game's rules and state, with no drawing and no browser in it: the
+// keeper, the beacon, the pools, the tides, the combo and the score. step()
+// advances one fixed step and returns what happened as bit flags, so the
+// caller can react (sounds, screens) without the world knowing about them.
+// Nothing here allocates after createWorld returns, except the short spawn
+// queue and drop queue a tide builds.
 
-export const EVENT_SHOOT = 1;
-export const EVENT_HIT = 2;
-export const EVENT_LANTERN_HIT = 4;
-export const EVENT_KILL = 8;
-export const EVENT_SHARD = 16;
-export const EVENT_WAVE_CLEAR = 32;
-export const EVENT_OVER = 64;
-export const EVENT_WIN = 128;
-export const EVENT_EXPLODE = 256;
-
-function dist2(ax, ay, bx, by) {
-  const dx = ax - bx;
-  const dy = ay - by;
-  return dx * dx + dy * dy;
-}
+import { BEACON, BREATHER_SECONDS, COMBO, DASH, ENEMY, FIELD, PLAYER, POOLS, TIDE_CLEAR_BONUS } from './config.js';
+import { EVENT_BEACON_HIT, EVENT_DASH, EVENT_EXPLODE, EVENT_HIT, EVENT_LEVELUP, EVENT_OVER, EVENT_ROAR, EVENT_SHIELD, EVENT_WAVE_CLEAR, EVENT_WAVE_START, EVENT_WIN } from './events.js';
+import { createRunStats } from './stats.js';
+import { countActive, createEnemyPool, edgeSpawnPoint, spawnEnemy, updateEnemies } from './enemies.js';
+import { createBoss, updateBoss } from './boss.js';
+import { clearProjectiles, createBoltPool, createGlobPool, createMinePool, createWispPool, damageAllInRadius, updateProjectiles, updateWeapons } from './weapons.js';
+import { clearGround, createPickupPool, createShardPool, dropPickup, spawnShards, updateGround, xpForLevel } from './pickups.js';
+import { availableUpgrades, createBuild, rollUpgrades, takeUpgrade } from './upgrades.js';
+import { TIDES, TOTAL_TIDES, buildEscort, buildSpawnQueue, tideBanner } from './waves.js';
 
 export function createWorld(random, particles) {
-  const player = {
-    x: FIELD.width / 2,
-    y: FIELD.height - 120,
-    hp: PLAYER.maxHp,
-    maxHp: PLAYER.maxHp,
-    invulnerable: 0,
-    fireTimer: 0,
-    aimX: FIELD.width / 2,
-    aimY: 0,
-  };
-  const stats = {
-    damage: PLAYER.emberDamage,
-    fireInterval: PLAYER.fireInterval,
-    projectiles: 1,
-    pierce: 0,
-    speed: PLAYER.speed,
-    splash: 0,
-    magnet: PLAYER.magnet,
-    emberSpeed: PLAYER.emberSpeed,
-    emberRange: PLAYER.emberRange,
-  };
-  const lantern = { hp: LANTERN.maxHp, maxHp: LANTERN.maxHp };
-
-  const enemies = [];
-  for (let index = 0; index < POOLS.enemies; index += 1) {
-    enemies.push({
-      active: false, kind: 'moth', x: 0, y: 0, hp: 1, maxHp: 1, speed: 0,
-      radius: 10, wobble: 0, wobbleSpeed: 1, flash: 0, gnawTimer: 0, spawnTimer: 0,
-    });
-  }
-  const projectiles = [];
-  for (let index = 0; index < POOLS.projectiles; index += 1) {
-    projectiles.push({
-      active: false, x: 0, y: 0, vx: 0, vy: 0, damage: 1, pierceLeft: 0,
-      travelled: 0, range: 500, trailTimer: 0,
-    });
-  }
-  const shards = [];
-  for (let index = 0; index < POOLS.shards; index += 1) {
-    shards.push({ active: false, x: 0, y: 0, vx: 0, vy: 0 });
-  }
-
   const state = {
-    player,
-    stats,
-    lantern,
-    enemies,
-    projectiles,
-    shards,
+    random,
     particles,
-    wave: 0,
-    phase: 'fighting',
-    score: 0,
-    combo: 0,
-    comboTimer: 0,
-    multiplier: 1,
-    kills: 0,
-    shardsCollected: 0,
-    taken: {},
-    offered: [],
     time: 0,
-    shake: 0,
-    banner: '',
-    bannerSub: '',
-    bannerTimer: 0,
+    player: {
+      x: FIELD.width / 2, y: FIELD.height - 160,
+      radius: PLAYER.radius,
+      hp: PLAYER.maxHp, maxHp: PLAYER.maxHp,
+      invulnerable: 0, shield: 0, shieldTimer: 0,
+      dashCd: 0, dashTime: 0, dashX: 0, dashY: 0,
+      aimX: FIELD.width / 2, aimY: 0,
+    },
+    beacon: { hp: BEACON.maxHp, maxHp: BEACON.maxHp },
+    build: createBuild(PLAYER),
+    enemies: createEnemyPool(POOLS.enemies),
+    boss: null,
+    bolts: createBoltPool(POOLS.bolts),
+    wisps: createWispPool(POOLS.wisps),
+    enemyShots: createGlobPool(POOLS.globs),
+    mines: createMinePool(POOLS.mines),
+    shards: createShardPool(POOLS.shards),
+    pickups: createPickupPool(POOLS.pickups),
+    tide: 0,
+    phase: 'attract',
     spawnQueue: [],
     spawnTimer: 0,
-    spawnInterval: 1,
-    over: false,
+    hpScale: 1,
+    bossSpawned: false,
+    breatherTimer: 0,
+    score: 0,
+    combo: { kills: 0, timer: 0 },
+    xp: 0,
+    level: 1,
+    xpNext: xpForLevel(1),
+    pendingLevels: 0,
+    cards: [],
+    stats: createRunStats(),
+    hitStop: 0,
+    banner: { text: '', sub: '', timer: 0 },
+    fireTimer: 0,
+    seekerTimer: 0,
+    novaTimer: 0,
+    mineTimer: 0,
+    dropQueue: [],
+    pendingBlast: null,
     won: false,
+    over: false,
   };
 
-  function freeEnemy() {
-    for (let index = 0; index < enemies.length; index += 1) {
-      if (!enemies[index].active) return enemies[index];
-    }
-    return null;
-  }
-
-  function freeProjectile() {
-    for (let index = 0; index < projectiles.length; index += 1) {
-      if (!projectiles[index].active) return projectiles[index];
-    }
-    return null;
-  }
-
-  function freeShard() {
-    for (let index = 0; index < shards.length; index += 1) {
-      if (!shards[index].active) return shards[index];
-    }
-    return null;
-  }
-
-  function edgePoint() {
-    const side = Math.floor(random() * 4);
-    const margin = 30;
-    if (side === 0) return { x: random() * FIELD.width, y: -margin };
-    if (side === 1) return { x: FIELD.width + margin, y: random() * FIELD.height };
-    if (side === 2) return { x: random() * FIELD.width, y: FIELD.height + margin };
-    return { x: -margin, y: random() * FIELD.height };
-  }
-
-  function spawnEnemy(kind, x, y) {
-    const def = ENEMY[kind];
-    const enemy = freeEnemy();
-    if (enemy === null || def === undefined) return null;
-    const waveDef = WAVES[state.wave - 1];
-    const hpScale = waveDef ? waveDef.hpScale : 1;
-    const at = x === undefined ? edgePoint() : { x, y };
-    enemy.active = true;
-    enemy.kind = kind;
-    enemy.x = at.x;
-    enemy.y = at.y;
-    enemy.maxHp = Math.round(def.hp * hpScale);
-    enemy.hp = enemy.maxHp;
-    enemy.speed = def.speed * (0.9 + random() * 0.2);
-    enemy.radius = def.radius;
-    enemy.wobble = random() * Math.PI * 2;
-    enemy.wobbleSpeed = 1.5 + random() * 2;
-    enemy.flash = 0;
-    enemy.gnawTimer = 0;
-    enemy.spawnTimer = 4;
-    return enemy;
-  }
-
-  function buildQueue(waveNumber) {
-    const waveDef = WAVES[waveNumber - 1];
-    const queue = [];
-    for (let index = 0; index < waveDef.count; index += 1) {
-      queue.push(waveDef.mix[Math.floor(random() * waveDef.mix.length)]);
-    }
-    if (waveDef.escort) {
-      for (let index = 0; index < waveDef.escort; index += 1) queue.push('moth');
-    }
-    return queue;
-  }
-
-  function startWave(waveNumber) {
-    state.wave = waveNumber;
-    state.phase = 'fighting';
-    state.spawnQueue = buildQueue(waveNumber);
-    state.spawnInterval = WAVES[waveNumber - 1].interval;
-    state.spawnTimer = 1.2;
-    state.banner = waveNumber === TOTAL_WAVES ? 'The Moth Queen' : `Wave ${waveNumber}`;
-    state.bannerSub = waveNumber === TOTAL_WAVES
-      ? 'Hold the light — she comes for it herself.'
-      : `${state.spawnQueue.length} creatures ride in from the dark.`;
-    state.bannerTimer = 2.2;
-  }
-
+  /** Fresh state for a new run; the pools are reused, never rebuilt. */
   function reset() {
-    player.x = FIELD.width / 2;
-    player.y = FIELD.height - 120;
-    player.hp = PLAYER.maxHp;
-    player.maxHp = PLAYER.maxHp;
-    player.invulnerable = 0;
-    player.fireTimer = 0;
-    stats.damage = PLAYER.emberDamage;
-    stats.fireInterval = PLAYER.fireInterval;
-    stats.projectiles = 1;
-    stats.pierce = 0;
-    stats.speed = PLAYER.speed;
-    stats.splash = 0;
-    stats.magnet = PLAYER.magnet;
-    stats.emberSpeed = PLAYER.emberSpeed;
-    stats.emberRange = PLAYER.emberRange;
-    lantern.hp = LANTERN.maxHp;
-    for (const enemy of enemies) enemy.active = false;
-    for (const shot of projectiles) shot.active = false;
-    for (const shard of shards) shard.active = false;
-    state.wave = 0;
-    state.phase = 'fighting';
-    state.score = 0;
-    state.combo = 0;
-    state.comboTimer = 0;
-    state.multiplier = 1;
-    state.kills = 0;
-    state.shardsCollected = 0;
-    state.taken = {};
-    state.offered = [];
     state.time = 0;
-    state.shake = 0;
-    state.banner = '';
-    state.bannerSub = '';
-    state.bannerTimer = 0;
+    state.player.x = FIELD.width / 2;
+    state.player.y = FIELD.height - 160;
+    state.player.hp = PLAYER.maxHp;
+    state.player.maxHp = PLAYER.maxHp;
+    state.player.invulnerable = 0;
+    state.player.shield = 0;
+    state.player.shieldTimer = 0;
+    state.player.dashCd = 0;
+    state.player.dashTime = 0;
+    state.player.aimX = FIELD.width / 2;
+    state.player.aimY = 0;
+    state.beacon.hp = BEACON.maxHp;
+    state.beacon.maxHp = BEACON.maxHp;
+    state.build = createBuild(PLAYER);
+    for (const enemy of state.enemies) enemy.active = false;
+    state.boss = null;
+    clearProjectiles(state);
+    clearGround(state);
+    state.tide = 0;
+    state.phase = 'attract';
     state.spawnQueue = [];
     state.spawnTimer = 0;
-    state.over = false;
+    state.hpScale = 1;
+    state.bossSpawned = false;
+    state.breatherTimer = 0;
+    state.score = 0;
+    state.combo.kills = 0;
+    state.combo.timer = 0;
+    state.xp = 0;
+    state.level = 1;
+    state.xpNext = xpForLevel(1);
+    state.pendingLevels = 0;
+    state.cards = [];
+    state.stats = createRunStats();
+    state.stats.lowestKeeperHp = PLAYER.maxHp;
+    state.stats.lowestBeaconHp = BEACON.maxHp;
+    state.hitStop = 0;
+    state.banner.text = '';
+    state.banner.sub = '';
+    state.banner.timer = 0;
+    state.fireTimer = 0;
+    state.seekerTimer = 0;
+    state.novaTimer = 0;
+    state.mineTimer = 0;
+    state.dropQueue.length = 0;
+    state.pendingBlast = null;
     state.won = false;
+    state.over = false;
   }
 
-  function dropShards(x, y, count) {
-    for (let index = 0; index < count; index += 1) {
-      const shard = freeShard();
-      if (shard === null) return;
-      const angle = random() * Math.PI * 2;
-      shard.active = true;
-      shard.x = x;
-      shard.y = y;
-      shard.vx = Math.cos(angle) * (40 + random() * 80);
-      shard.vy = Math.sin(angle) * (40 + random() * 80);
+  /** The title screen's living background: drifters wandering the reef. */
+  function seedAttract() {
+    for (let index = 0; index < 9; index += 1) {
+      const x = random.range(80, FIELD.width - 80);
+      const y = random.range(80, FIELD.height - 80);
+      const kind = index % 3 === 0 ? 'dart' : 'drifter';
+      spawnEnemy(state.enemies, kind, x, y, 1, false, state.time);
     }
   }
 
-  /** The burst a slain creature sets off; returns EVENT_EXPLODE when it went off. */
-  function explodeAt(x, y, events) {
-    particles.burst(x, y, 26, '#9fe870', 260, 4, 0.6);
-    particles.burst(x, y, 12, '#ffb347', 180, 3, 0.5);
-    state.shake = Math.max(state.shake, 0.3);
-    for (let index = 0; index < enemies.length; index += 1) {
-      const other = enemies[index];
-      if (!other.active) continue;
-      if (dist2(x, y, other.x, other.y) < 80 * 80) damageEnemy(other, 3, events);
+  /** Begin a tide: its queue, its banner, and the Maw on the last one. */
+  function startWave(tide) {
+    const definition = TIDES[tide - 1];
+    state.tide = tide;
+    state.hpScale = definition.hpScale;
+    state.phase = 'fighting';
+    state.banner.text = tideBanner(tide);
+    state.banner.sub = tide === TOTAL_TIDES ? 'Hold the light. End the Maw.' : `Tide ${tide} of ${TOTAL_TIDES}`;
+    state.banner.timer = 2.4;
+    if (definition.boss) {
+      state.boss = createBoss(random);
+      state.bossSpawned = true;
+      state.spawnQueue = buildEscort(random, definition.escort);
+      state.spawnTimer = 1.5;
+      return EVENT_WAVE_START | EVENT_ROAR;
     }
-    if (dist2(x, y, player.x, player.y) < 64 * 64 && player.invulnerable <= 0) {
-      hurtPlayer(1, events);
-    }
-    return events | EVENT_EXPLODE;
+    state.spawnQueue = buildSpawnQueue(tide, random);
+    state.spawnTimer = 0.8;
+    return EVENT_WAVE_START;
   }
 
-  function hurtPlayer(amount, events) {
-    if (player.invulnerable > 0 || state.over) return events;
+  /** Hurt the keeper: the ward absorbs a blow first, then a heart is lost. */
+  function damagePlayer(amount) {
+    const player = state.player;
+    if (player.invulnerable > 0 || player.dashTime > 0) return 0;
+    if (player.shield > 0) {
+      player.shield -= 1;
+      player.invulnerable = 0.5;
+      particles.ring(player.x, player.y, '#93c5fd', 34, 0.4);
+      return EVENT_SHIELD;
+    }
     player.hp -= amount;
     player.invulnerable = PLAYER.invulnerable;
-    state.combo = 0;
-    state.comboTimer = 0;
-    state.multiplier = 1;
-    state.shake = Math.max(state.shake, 0.4);
-    particles.burst(player.x, player.y, 18, '#8ef6ff', 220, 4, 0.5);
-    if (player.hp <= 0) {
-      player.hp = 0;
-      state.over = true;
-      return events | EVENT_HIT | EVENT_OVER;
-    }
-    return events | EVENT_HIT;
+    particles.burst(player.x, player.y, '#5eead4', 16, 200, 0.5, 3);
+    particles.addShake(0.4);
+    state.stats.lowestKeeperHp = Math.min(state.stats.lowestKeeperHp, player.hp);
+    return EVENT_HIT;
   }
 
-  function damageEnemy(enemy, amount, events) {
-    if (!enemy.active) return events;
-    enemy.hp -= amount;
-    enemy.flash = 0.12;
-    if (enemy.hp > 0) return events;
-    return killEnemy(enemy, events);
+  /** Hurt the beacon: the light dims, and the reef shakes. */
+  function damageBeacon(amount) {
+    state.beacon.hp -= amount;
+    particles.burst(BEACON.x, BEACON.y, '#7de8ff', 14, 180, 0.5, 3);
+    particles.addShake(0.35);
+    state.stats.lowestBeaconHp = Math.min(state.stats.lowestBeaconHp, state.beacon.hp);
+    return EVENT_BEACON_HIT;
   }
 
-  function killEnemy(enemy, events) {
-    if (!enemy.active) return events;
-    enemy.active = false;
-    const def = ENEMY[enemy.kind];
-    state.kills += 1;
-    state.combo += 1;
-    state.comboTimer = COMBO.window;
-    state.multiplier = Math.min(COMBO.maxMultiplier, 1 + Math.floor(state.combo / COMBO.perStep));
-    const gained = def.score * state.multiplier;
-    state.score += gained;
-    particles.burst(enemy.x, enemy.y, enemy.kind === 'queen' ? 60 : 14, '#b79ced', 200, 4, 0.6);
-    particles.floatText(enemy.x, enemy.y - 10, `+${gained}`, '#ffd166', 18);
-    dropShards(enemy.x, enemy.y, def.shards);
-    if (stats.splash > 0) {
-      for (let index = 0; index < enemies.length; index += 1) {
-        const other = enemies[index];
-        if (other.active && other !== enemy && dist2(enemy.x, enemy.y, other.x, other.y) < 64 * 64) {
-          damageEnemy(other, stats.splash, events);
-        }
+  /** Settle every touch: creatures, the boss and globs against keeper and beacon. */
+  function collide(dt) {
+    let events = 0;
+    const player = state.player;
+    for (let index = 0; index < state.enemies.length; index += 1) {
+      const enemy = state.enemies[index];
+      if (!enemy.active) continue;
+      const definition = ENEMY[enemy.kind];
+      const dxPlayer = enemy.x - player.x;
+      const dyPlayer = enemy.y - player.y;
+      const reachPlayer = enemy.radius + PLAYER.radius;
+      if (dxPlayer * dxPlayer + dyPlayer * dyPlayer <= reachPlayer * reachPlayer && enemy.touchCd <= 0) {
+        enemy.touchCd = 0.8;
+        events |= damagePlayer(definition.touchDamage);
+        const distance = Math.hypot(dxPlayer, dyPlayer) || 1;
+        enemy.knockX += (dxPlayer / distance) * 220;
+        enemy.knockY += (dyPlayer / distance) * 220;
+      }
+      const dxBeacon = enemy.x - BEACON.x;
+      const dyBeacon = enemy.y - BEACON.y;
+      const reachBeacon = enemy.radius + BEACON.radius;
+      if (dxBeacon * dxBeacon + dyBeacon * dyBeacon <= reachBeacon * reachBeacon) {
+        enemy.active = false;
+        events |= damageBeacon(definition.beaconDamage);
+        particles.burst(enemy.x, enemy.y, '#e11d48', 12, 170, 0.5, 3);
       }
     }
-    if (enemy.kind === 'bomber') events = explodeAt(enemy.x, enemy.y, events);
-    if (enemy.kind === 'queen') state.shake = Math.max(state.shake, 0.6);
-    return events | EVENT_KILL;
+
+    const boss = state.boss;
+    if (boss !== null && boss.active) {
+      const dxPlayer = boss.x - player.x;
+      const dyPlayer = boss.y - player.y;
+      const reachPlayer = boss.radius + PLAYER.radius;
+      if (dxPlayer * dxPlayer + dyPlayer * dyPlayer <= reachPlayer * reachPlayer && boss.touchCd <= 0) {
+        boss.touchCd = 0.8;
+        events |= damagePlayer(ENEMY.maw.touchDamage);
+      }
+      const dxBeacon = boss.x - BEACON.x;
+      const dyBeacon = boss.y - BEACON.y;
+      const reachBeacon = boss.radius + BEACON.radius;
+      if (dxBeacon * dxBeacon + dyBeacon * dyBeacon <= reachBeacon * reachBeacon && boss.touchCd <= 0) {
+        boss.touchCd = 1.2;
+        events |= damageBeacon(ENEMY.maw.beaconDamage);
+        // The Maw recoils from the beacon's heart-light instead of chewing it down.
+        boss.x = FIELD.width / 2;
+        boss.y = 90;
+        boss.chargeState = 'idle';
+        particles.ring(BEACON.x, BEACON.y, '#7de8ff', 90, 0.6);
+      }
+    }
+
+    for (let index = 0; index < state.enemyShots.length; index += 1) {
+      const glob = state.enemyShots[index];
+      if (!glob.active) continue;
+      const dxPlayer = glob.x - player.x;
+      const dyPlayer = glob.y - player.y;
+      const reachPlayer = glob.radius + PLAYER.radius;
+      if (dxPlayer * dxPlayer + dyPlayer * dyPlayer <= reachPlayer * reachPlayer) {
+        glob.active = false;
+        events |= damagePlayer(1);
+        continue;
+      }
+      const dxBeacon = glob.x - BEACON.x;
+      const dyBeacon = glob.y - BEACON.y;
+      const reachBeacon = glob.radius + BEACON.radius;
+      if (dxBeacon * dxBeacon + dyBeacon * dyBeacon <= reachBeacon * reachBeacon) {
+        glob.active = false;
+        events |= damageBeacon(glob.damage);
+      }
+    }
+    return events;
   }
 
-  function fireEmbers(aimX, aimY) {
-    const dx = aimX - player.x;
-    const dy = aimY - player.y;
-    const base = Math.atan2(dy, dx);
-    const count = stats.projectiles;
-    const spread = 0.13;
-    for (let index = 0; index < count; index += 1) {
-      const shot = freeProjectile();
-      if (shot === null) return;
-      const offset = (index - (count - 1) / 2) * spread;
-      const angle = base + offset;
-      shot.active = true;
-      shot.x = player.x + Math.cos(angle) * (PLAYER.radius + 8);
-      shot.y = player.y + Math.sin(angle) * (PLAYER.radius + 8);
-      shot.vx = Math.cos(angle) * stats.emberSpeed;
-      shot.vy = Math.sin(angle) * stats.emberSpeed;
-      shot.damage = stats.damage;
-      shot.pierceLeft = stats.pierce;
-      shot.travelled = 0;
-      shot.range = stats.emberRange;
-      shot.trailTimer = 0;
+  /** Drain the drop queue: shards scatter, pickups land. */
+  function settleDrops() {
+    for (const drop of state.dropQueue) {
+      spawnShards(state, drop.x, drop.y, drop.xp);
+      if (drop.pickup !== null) dropPickup(state, drop.x, drop.y, drop.pickup);
     }
-    player.fireTimer = stats.fireInterval;
+    state.dropQueue.length = 0;
   }
 
-  function updatePlayer(dt, input) {
-    const move = input.move();
-    const length = Math.hypot(move.x, move.y);
-    if (length > 0) {
-      player.x += (move.x / length) * stats.speed * dt;
-      player.y += (move.y / length) * stats.speed * dt;
-    }
-    player.x = Math.min(FIELD.width - 24, Math.max(24, player.x));
-    player.y = Math.min(FIELD.height - 24, Math.max(24, player.y));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
+  /** Move the keeper: swim, dash, and count down every timer that guards her. */
+  function movePlayer(dt, input) {
+    const player = state.player;
+    const build = state.build;
     const aim = input.aim();
     player.aimX = aim.x;
     player.aimY = aim.y;
-    player.fireTimer -= dt;
-    if (input.firing && player.fireTimer <= 0) {
-      fireEmbers(aim.x, aim.y);
-      return EVENT_SHOOT;
+    player.invulnerable = Math.max(0, player.invulnerable - dt);
+    player.dashCd = Math.max(0, player.dashCd - dt);
+    if (player.shieldTimer > 0) {
+      player.shieldTimer -= dt;
+      if (player.shieldTimer <= 0) player.shield = 0;
     }
-    return 0;
-  }
-
-  function updateProjectiles(dt, events) {
-    for (let index = 0; index < projectiles.length; index += 1) {
-      const shot = projectiles[index];
-      if (!shot.active) continue;
-      shot.x += shot.vx * dt;
-      shot.y += shot.vy * dt;
-      shot.travelled += Math.hypot(shot.vx, shot.vy) * dt;
-      shot.trailTimer -= dt;
-      if (shot.trailTimer <= 0) {
-        particles.trail(shot.x, shot.y, '#ff7a3c');
-        shot.trailTimer = 0.03;
+    let events = 0;
+    if (input.takeDash() && player.dashCd <= 0 && player.dashTime <= 0) {
+      const move = input.move();
+      let dirX = move.x;
+      let dirY = move.y;
+      if (dirX === 0 && dirY === 0) {
+        const dx = aim.x - player.x;
+        const dy = aim.y - player.y;
+        const distance = Math.hypot(dx, dy) || 1;
+        dirX = dx / distance;
+        dirY = dy / distance;
       }
-      if (shot.travelled >= shot.range || shot.x < -20 || shot.x > FIELD.width + 20 || shot.y < -20 || shot.y > FIELD.height + 20) {
-        shot.active = false;
-        continue;
-      }
-      for (let other = 0; other < enemies.length; other += 1) {
-        const enemy = enemies[other];
-        if (!enemy.active) continue;
-        const reach = enemy.radius + PLAYER.emberRadius;
-        if (dist2(shot.x, shot.y, enemy.x, enemy.y) < reach * reach) {
-          events = damageEnemy(enemy, shot.damage, events);
-          particles.burst(shot.x, shot.y, 4, '#ffd166', 120, 3, 0.3);
-          if (shot.pierceLeft > 0) {
-            shot.pierceLeft -= 1;
-          } else {
-            shot.active = false;
-          }
-          break;
-        }
-      }
+      player.dashX = dirX;
+      player.dashY = dirY;
+      player.dashTime = DASH.time;
+      player.dashCd = build.dashCooldown;
+      state.stats.dashesUsed += 1;
+      particles.burst(player.x, player.y, '#5eead4', 8, 140, 0.3, 3);
+      events |= EVENT_DASH;
     }
+    if (player.dashTime > 0) {
+      player.dashTime -= dt;
+      player.x += player.dashX * DASH.speed * dt;
+      player.y += player.dashY * DASH.speed * dt;
+      particles.mote(player.x, player.y, '#5eead4', 3, 0.3, 10);
+    } else {
+      const move = input.move();
+      player.x += move.x * build.speed * dt;
+      player.y += move.y * build.speed * dt;
+    }
+    player.x = Math.max(PLAYER.radius, Math.min(FIELD.width - PLAYER.radius, player.x));
+    player.y = Math.max(PLAYER.radius, Math.min(FIELD.height - PLAYER.radius, player.y));
     return events;
   }
 
-  function updateEnemies(dt, events) {
-    let alive = 0;
-    for (let index = 0; index < enemies.length; index += 1) {
-      const enemy = enemies[index];
-      if (!enemy.active) continue;
-      alive += 1;
-      if (enemy.flash > 0) enemy.flash = Math.max(0, enemy.flash - dt);
-      if (enemy.gnawTimer > 0) enemy.gnawTimer -= dt;
-      const def = ENEMY[enemy.kind];
-      const target = def.target === 'player' ? player : LANTERN;
-      const dx = target.x - enemy.x;
-      const dy = target.y - enemy.y;
-      const distance = Math.hypot(dx, dy) || 1;
-      // Wobble sideways so the swarm never walks in a straight line.
-      const wobble = Math.sin(state.time * enemy.wobbleSpeed + enemy.wobble) * 0.55;
-      const nx = dx / distance;
-      const ny = dy / distance;
-      const px = -ny * wobble;
-      const py = nx * wobble;
-      enemy.x += (nx + px) * enemy.speed * dt;
-      enemy.y += (ny + py) * enemy.speed * dt;
-
-      if (enemy.kind === 'queen') {
-        enemy.spawnTimer -= dt;
-        if (enemy.spawnTimer <= 0) {
-          enemy.spawnTimer = 4;
-          for (let gnat = 0; gnat < 3; gnat += 1) {
-            spawnEnemy('gnat', enemy.x + (random() - 0.5) * 60, enemy.y + (random() - 0.5) * 60);
-          }
-        }
-      }
-
-      const lanternReach = enemy.radius + LANTERN.radius - 4;
-      if (def.target === 'lantern' && dist2(enemy.x, enemy.y, LANTERN.x, LANTERN.y) < lanternReach * lanternReach) {
-        if (enemy.gnawTimer <= 0) {
-          lantern.hp = Math.max(0, lantern.hp - def.lanternDamage);
-          state.combo = 0;
-          state.comboTimer = 0;
-          state.multiplier = 1;
-          state.shake = Math.max(state.shake, 0.3);
-          particles.burst(LANTERN.x, LANTERN.y, 10, '#ffb347', 160, 3, 0.5);
-          events |= EVENT_LANTERN_HIT;
-          if (lantern.hp <= 0) {
-            state.over = true;
-            events |= EVENT_OVER;
-            return { events, alive };
-          }
-          if (enemy.kind === 'queen') {
-            enemy.gnawTimer = 2;
-            enemy.x += (enemy.x - LANTERN.x) / distance * 120;
-            enemy.y += (enemy.y - LANTERN.y) / distance * 120;
-          } else {
-            enemy.active = false;
-            alive -= 1;
-          }
-        }
-        continue;
-      }
-
-      const playerReach = enemy.radius + PLAYER.radius;
-      if (dist2(enemy.x, enemy.y, player.x, player.y) < playerReach * playerReach) {
-        if (enemy.kind === 'thief') {
-          // A thief steals the combo and vanishes; it never hurts the keeper.
-          state.combo = 0;
-          state.comboTimer = 0;
-          state.multiplier = 1;
-          particles.floatText(player.x, player.y - 24, 'Combo stolen!', '#f27bb1', 18);
-          enemy.active = false;
-          alive -= 1;
-          events |= EVENT_HIT;
-        } else if (player.invulnerable <= 0) {
-          const before = events;
-          events = hurtPlayer(def.touchDamage, events);
-          if (events !== before && !state.over) {
-            enemy.x += (enemy.x - player.x) / distance * 40;
-            enemy.y += (enemy.y - player.y) / distance * 40;
-          }
-        }
-      }
-    }
-    return { events, alive };
-  }
-
-  function updateShards(dt, events) {
-    for (let index = 0; index < shards.length; index += 1) {
-      const shard = shards[index];
-      if (!shard.active) continue;
-      const dx = player.x - shard.x;
-      const dy = player.y - shard.y;
-      const distance = Math.hypot(dx, dy) || 1;
-      if (distance < stats.magnet) {
-        const pull = 620 * (1 - distance / (stats.magnet + 60));
-        shard.vx += (dx / distance) * pull * dt * 4;
-        shard.vy += (dy / distance) * pull * dt * 4;
-      }
-      shard.vx *= 1 - Math.min(0.9, 2.4 * dt);
-      shard.vy *= 1 - Math.min(0.9, 2.4 * dt);
-      shard.x += shard.vx * dt;
-      shard.y += shard.vy * dt;
-      if (distance < SHARD.collectRadius) {
-        shard.active = false;
-        state.score += SHARD.score;
-        state.shardsCollected += 1;
-        particles.burst(shard.x, shard.y, 3, '#ffd166', 90, 2, 0.3);
-        events |= EVENT_SHARD;
-      }
-    }
-    return events;
-  }
-
-  /**
-   * One fixed step of the real game. `input` is the frame's input snapshot.
-   * Returns bit flags of what happened (EVENT_*), so the caller can play
-   * sounds and show banners.
-   */
+  /** One fixed step of the fighting game. Returns events. */
   function step(dt, input) {
+    if (state.phase === 'levelup' || state.phase === 'done') return 0;
     let events = 0;
     state.time += dt;
-    if (state.bannerTimer > 0) state.bannerTimer -= dt;
-    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 1.6);
-    if (state.comboTimer > 0) {
-      state.comboTimer -= dt;
-      if (state.comboTimer <= 0) {
-        state.combo = 0;
-        state.multiplier = 1;
-      }
+    state.stats.timePlayed += dt;
+    state.banner.timer = Math.max(0, state.banner.timer - dt);
+    if (state.combo.timer > 0) {
+      state.combo.timer -= dt;
+      if (state.combo.timer <= 0) state.combo.kills = 0;
     }
 
-    events |= updatePlayer(dt, input);
+    if (state.phase === 'breather') {
+      state.breatherTimer -= dt;
+      events |= movePlayer(dt, input);
+      events |= updateGround(state, dt);
+      settleDrops();
+      if (state.breatherTimer <= 0) {
+        events |= startWave(state.tide + 1);
+      }
+      return events;
+    }
 
+    events |= movePlayer(dt, input);
+
+    // The tide rises: one creature per interval, from a random edge.
     if (state.spawnQueue.length > 0) {
       state.spawnTimer -= dt;
       if (state.spawnTimer <= 0) {
-        const kind = state.spawnQueue.shift();
-        spawnEnemy(kind);
-        state.spawnTimer = state.spawnInterval * (0.9 + random() * 0.2);
+        state.spawnTimer = TIDES[state.tide - 1].interval;
+        const next = state.spawnQueue.shift();
+        const point = edgeSpawnPoint(random);
+        spawnEnemy(state.enemies, next.kind, point.x, point.y, state.hpScale, next.elite, state.time);
       }
     }
 
-    events = updateProjectiles(dt, events);
-    const moved = updateEnemies(dt, events);
-    events = moved.events;
-    if (state.over) return events;
-    events = updateShards(dt, events);
+    updateEnemies(state, dt);
+    events |= updateBoss(state, dt);
+    events |= updateWeapons(state, dt, input);
+    events |= updateProjectiles(state, dt);
+    events |= updateGround(state, dt);
+    settleDrops();
 
-    if (state.spawnQueue.length === 0 && moved.alive === 0) {
-      if (state.wave >= TOTAL_WAVES) {
-        state.won = true;
-        state.phase = 'done';
-        return events | EVENT_WIN;
+    if (state.pendingBlast !== null) {
+      const blast = state.pendingBlast;
+      state.pendingBlast = null;
+      events |= damageAllInRadius(state, blast.x, blast.y, blast.radius, blast.damage);
+      particles.ring(blast.x, blast.y, '#f97316', blast.radius, 0.6);
+      particles.burst(blast.x, blast.y, '#fdba74', 30, 300, 0.6, 4);
+      particles.addShake(0.5);
+      events |= EVENT_EXPLODE;
+    }
+
+    events |= collide(dt);
+
+    // Level-ups queue: each one stops the fight for a choice of three.
+    while (state.xp >= state.xpNext) {
+      state.xp -= state.xpNext;
+      state.level += 1;
+      state.xpNext = xpForLevel(state.level);
+      state.pendingLevels += 1;
+      state.stats.levelsGained += 1;
+    }
+    if (state.pendingLevels > 0 && state.phase === 'fighting') {
+      if (availableUpgrades(state.build).length === 0) {
+        state.pendingLevels = 0;
+        state.score += 500;
+      } else {
+        state.cards = rollUpgrades(state.build, random, 3);
+        state.phase = 'levelup';
+        particles.ring(state.player.x, state.player.y, '#7de8ff', 80, 0.7);
+        events |= EVENT_LEVELUP;
       }
-      state.score += WAVE_CLEAR_BONUS * state.wave;
-      state.offered = drawUpgrades(random, state.taken);
-      state.phase = 'intermission';
-      return events | EVENT_WAVE_CLEAR;
+    }
+
+    // The Maw's fall is the victory; the reef is cleared in celebration.
+    if (state.tide === TOTAL_TIDES && state.bossSpawned && state.boss !== null && !state.boss.active && !state.won) {
+      for (const enemy of state.enemies) {
+        if (!enemy.active) continue;
+        enemy.active = false;
+        particles.burst(enemy.x, enemy.y, '#7dd3fc', 8, 150, 0.5, 3);
+      }
+      clearProjectiles(state);
+      state.won = true;
+      state.phase = 'done';
+      state.score += state.beacon.hp * 10 + state.level * 50 + ENEMY.maw.score;
+      events |= EVENT_WIN;
+      return events;
+    }
+
+    // A tide is cleared when nothing is left to rise and nothing swims.
+    if (state.phase === 'fighting' && state.tide < TOTAL_TIDES && state.spawnQueue.length === 0 && countActive(state.enemies) === 0) {
+      state.score += TIDE_CLEAR_BONUS * state.tide;
+      state.phase = 'breather';
+      state.breatherTimer = BREATHER_SECONDS;
+      state.banner.text = `TIDE ${state.tide} CLEARED`;
+      state.banner.sub = `+${TIDE_CLEAR_BONUS * state.tide} — the water calms`;
+      state.banner.timer = 2.2;
+      state.beacon.hp = Math.min(state.beacon.maxHp, state.beacon.hp + 10);
+      events |= EVENT_WAVE_CLEAR;
+    }
+
+    if (!state.won && (state.beacon.hp <= 0 || state.player.hp <= 0)) {
+      state.beacon.hp = Math.max(0, state.beacon.hp);
+      state.player.hp = Math.max(0, state.player.hp);
+      state.over = true;
+      state.phase = 'done';
+      events |= EVENT_OVER;
     }
     return events;
   }
 
-  /** The title screen's backdrop: moths drift in, circle the light, dissolve. */
+  /** The title screen's water: drifters wander, nothing fights. */
   function stepAttract(dt) {
     state.time += dt;
-    if (state.bannerTimer > 0) state.bannerTimer -= dt;
-    let alive = 0;
-    for (const enemy of enemies) if (enemy.active) alive += 1;
-    if (alive < 7 && random() < dt * 0.8) {
-      spawnEnemy(random() < 0.7 ? 'moth' : 'gnat');
-    }
-    for (const enemy of enemies) {
+    for (let index = 0; index < state.enemies.length; index += 1) {
+      const enemy = state.enemies[index];
       if (!enemy.active) continue;
-      const dx = LANTERN.x - enemy.x;
-      const dy = LANTERN.y - enemy.y;
-      const distance = Math.hypot(dx, dy) || 1;
-      const wobble = Math.sin(state.time * enemy.wobbleSpeed + enemy.wobble) * 0.8;
-      enemy.x += (dx / distance - (dy / distance) * wobble) * enemy.speed * 0.45 * dt;
-      enemy.y += (dy / distance + (dx / distance) * wobble) * enemy.speed * 0.45 * dt;
-      if (distance < LANTERN.radius + enemy.radius + 26) {
-        particles.burst(enemy.x, enemy.y, 3, '#b79ced', 60, 2, 0.4);
-        enemy.active = false;
-      }
+      const angle = state.time * 0.25 + enemy.wobble;
+      enemy.x += Math.cos(angle) * 26 * dt;
+      enemy.y += Math.sin(angle * 0.7) * 20 * dt;
+      if (enemy.x < 20) enemy.x = FIELD.width - 20;
+      if (enemy.x > FIELD.width - 20) enemy.x = 20;
+      if (enemy.y < 20) enemy.y = FIELD.height - 20;
+      if (enemy.y > FIELD.height - 20) enemy.y = 20;
     }
-    particles.update(dt);
   }
 
-  /** Take one of the three offered upgrades and open the next wave. */
+  /** Take one of the offered cards; more queued levels roll again. */
   function chooseUpgrade(index) {
-    const upgrade = state.offered[index];
-    if (!upgrade || state.phase !== 'intermission') return false;
-    state.taken[upgrade.id] = (state.taken[upgrade.id] ?? 0) + 1;
-    upgrade.apply(stats, state);
-    state.offered = [];
-    startWave(state.wave + 1);
+    if (state.phase !== 'levelup' || index < 0 || index >= state.cards.length) return false;
+    const card = state.cards[index];
+    takeUpgrade(state.build, card, state);
+    state.pendingLevels -= 1;
+    if (state.pendingLevels > 0 && availableUpgrades(state.build).length > 0) {
+      state.cards = rollUpgrades(state.build, random, 3);
+    } else {
+      state.pendingLevels = 0;
+      state.cards = [];
+      state.phase = 'fighting';
+    }
     return true;
   }
 
+  /** Foes still to face this tide: queued, swimming, and the Maw. */
+  function remainingFoes() {
+    let count = state.spawnQueue.length + countActive(state.enemies);
+    if (state.boss !== null && state.boss.active) count += 1;
+    return count;
+  }
+
   reset();
-  return { state, reset, step, stepAttract, startWave, chooseUpgrade };
+  return { state, reset, seedAttract, startWave, step, stepAttract, chooseUpgrade, remainingFoes };
 }

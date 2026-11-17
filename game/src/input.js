@@ -1,114 +1,161 @@
-// Keyboard and mouse input. Held keys give a movement direction; one-shot
-// presses (start, pause, mute, upgrade picks) are queued as bit flags and taken
-// once by the loop, so a press between two frames is never lost and never
-// counted twice. Mouse position is kept in field coordinates, and clicks are
-// queued with their position for the screens that need them (title, upgrades).
+// Keyboard and mouse, read as one input: a movement vector, an aim point in
+// field coordinates, whether the trigger is held, and the edge-triggered
+// actions (confirm, pause, mute, dash) and clicks the screens consume. Keys
+// the game uses never scroll the page. Pointer events cover mouse and touch
+// alike; the game itself is tuned for keyboard and mouse.
 
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
 export const ACTION_MUTE = 4;
 
-const UP = new Set(['ArrowUp', 'KeyW']);
-const DOWN = new Set(['ArrowDown', 'KeyS']);
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
+const MOVE_KEYS = {
+  KeyW: [0, -1],
+  ArrowUp: [0, -1],
+  KeyS: [0, 1],
+  ArrowDown: [0, 1],
+  KeyA: [-1, 0],
+  ArrowLeft: [-1, 0],
+  KeyD: [1, 0],
+  ArrowRight: [1, 0],
+};
 
 export function createInput(canvas, toField) {
-  let up = false;
-  let down = false;
-  let left = false;
-  let right = false;
-  let firing = false;
-  let actions = 0;
-  let upgradePick = -1;
-  let mouseX = 640;
-  let mouseY = 360;
+  const pressed = new Set();
   const clicks = [];
+  const upgradePicks = [];
+  let actions = 0;
+  let dashQueued = false;
+  let pointerDown = false;
+  let pointerX = 0;
+  let pointerY = 0;
 
-  window.addEventListener('keydown', (event) => {
-    if (UP.has(event.code)) up = true;
-    else if (DOWN.has(event.code)) down = true;
-    else if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else if (event.code === 'KeyM') {
-      if (!event.repeat) actions |= ACTION_MUTE;
-    } else if (event.code === 'Digit1' || event.code === 'Numpad1') upgradePick = 0;
-    else if (event.code === 'Digit2' || event.code === 'Numpad2') upgradePick = 1;
-    else if (event.code === 'Digit3' || event.code === 'Numpad3') upgradePick = 2;
-    else return;
-    event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    if (UP.has(event.code)) up = false;
-    else if (DOWN.has(event.code)) down = false;
-    else if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
-  window.addEventListener('blur', () => {
-    up = false;
-    down = false;
-    left = false;
-    right = false;
-    firing = false;
-  });
-
-  function trackPointer(event) {
+  function fieldPoint(event) {
     const rect = canvas.getBoundingClientRect();
-    const point = toField(event.clientX - rect.left, event.clientY - rect.top, rect.width, rect.height);
-    mouseX = point.x;
-    mouseY = point.y;
+    return toField(event.clientX - rect.left, event.clientY - rect.top);
   }
-  canvas.addEventListener('pointermove', trackPointer);
-  canvas.addEventListener('pointerdown', (event) => {
-    trackPointer(event);
-    firing = true;
-    clicks.push({ x: mouseX, y: mouseY });
-  });
-  window.addEventListener('pointerup', () => {
-    firing = false;
-  });
-  // Space also fires while held: the keeper throws embers with the keyboard too.
-  window.addEventListener('keydown', (event) => {
-    if (event.code === 'Space') firing = true;
-  });
-  window.addEventListener('keyup', (event) => {
-    if (event.code === 'Space') firing = false;
-  });
+
+  function onKeyDown(event) {
+    if (event.repeat) return;
+    if (MOVE_KEYS[event.code] !== undefined) {
+      pressed.add(event.code);
+      event.preventDefault();
+      return;
+    }
+    if (event.code === 'Space' || event.code === 'Enter') {
+      actions |= ACTION_CONFIRM;
+      dashQueued = true;
+      event.preventDefault();
+      return;
+    }
+    if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
+      dashQueued = true;
+      event.preventDefault();
+      return;
+    }
+    if (event.code === 'KeyP' || event.code === 'Escape') {
+      actions |= ACTION_PAUSE;
+      event.preventDefault();
+      return;
+    }
+    if (event.code === 'KeyM') {
+      actions |= ACTION_MUTE;
+      return;
+    }
+    if (event.code === 'Digit1' || event.code === 'Digit2' || event.code === 'Digit3') {
+      upgradePicks.push(Number(event.code.slice(-1)) - 1);
+    }
+  }
+
+  function onKeyUp(event) {
+    pressed.delete(event.code);
+  }
+
+  function onPointerDown(event) {
+    const point = fieldPoint(event);
+    pointerX = point.x;
+    pointerY = point.y;
+    pointerDown = true;
+    clicks.push({ x: point.x, y: point.y });
+    try {
+      canvas.setPointerCapture?.(event.pointerId);
+    } catch {
+      // Capture can fail for a pointer that is already gone; the game plays on.
+    }
+  }
+
+  function onPointerMove(event) {
+    const point = fieldPoint(event);
+    pointerX = point.x;
+    pointerY = point.y;
+  }
+
+  function onPointerUp() {
+    pointerDown = false;
+  }
+
+  function onBlur() {
+    pressed.clear();
+    pointerDown = false;
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  window.addEventListener('blur', onBlur);
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
   return {
-    /** Movement direction, each axis -1, 0 or 1, diagonals unnormalized. */
+    /** The movement vector from the held keys, normalised, or zero. */
     move() {
-      return { x: (right ? 1 : 0) - (left ? 1 : 0), y: (down ? 1 : 0) - (up ? 1 : 0) };
+      let x = 0;
+      let y = 0;
+      for (const code of pressed) {
+        const step = MOVE_KEYS[code];
+        if (step !== undefined) {
+          x += step[0];
+          y += step[1];
+        }
+      }
+      const length = Math.hypot(x, y);
+      if (length === 0) return { x: 0, y: 0 };
+      return { x: x / length, y: y / length };
     },
-    /** Where the mouse aims, in field coordinates. */
+    /** The aim point in field coordinates: where the pointer is. */
     aim() {
-      return { x: mouseX, y: mouseY };
+      return { x: pointerX, y: pointerY };
     },
     get firing() {
-      return firing;
+      return pointerDown;
     },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
+    /** Actions raised since the last read, as a bit mask (then cleared). */
     takeActions() {
       const taken = actions;
       actions = 0;
       return taken;
     },
-    /** The upgrade card index picked with 1/2/3 since the last call, or -1. */
-    takeUpgradePick() {
-      const pick = upgradePick;
-      upgradePick = -1;
-      return pick;
-    },
-    /** The clicks since the last call, each {x, y} in field coordinates. */
+    /** Clicks since the last read, in field coordinates (then cleared). */
     takeClicks() {
       return clicks.splice(0, clicks.length);
+    },
+    /** The oldest upgrade pick (0, 1 or 2), or -1 when none was pressed. */
+    takeUpgradePick() {
+      return upgradePicks.length > 0 ? upgradePicks.shift() : -1;
+    },
+    /** True once when the dash key was pressed since the last read. */
+    takeDash() {
+      const taken = dashQueued;
+      dashQueued = false;
+      return taken;
+    },
+    /** Forget held keys and clicks (used when the screen changes). */
+    flush() {
+      actions = 0;
+      dashQueued = false;
+      clicks.length = 0;
+      upgradePicks.length = 0;
     },
   };
 }
