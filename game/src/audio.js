@@ -1,87 +1,98 @@
-// Every sound is synthesized with WebAudio: no audio files, nothing fetched.
-// Short effects are oscillators and filtered noise; the music is a small
-// generative loop — a slow pad under a pentatonic arpeggio — whose pace and
-// root follow the fight. Nothing starts until a gesture unlocks the context,
-// and every call is a no-op when audio is unavailable or muted.
+// Every sound is synthesized with WebAudio: no audio files, no network.
+// Short oscillator and noise bursts for effects, and a small step sequencer
+// for music — a calm arpeggio on the title, a driving line in combat, and
+// a low pulse under the bosses. The context stays suspended until the first
+// input unlocks it, as browsers require.
 
-const SHOT_GAP = 0.06;
-const KILL_GAP = 0.05;
-const SHARD_GAP = 0.05;
+const NOTE = {
+  C3: 130.81, D3: 146.83, E3: 164.81, G3: 196.0, A3: 220.0,
+  C4: 261.63, D4: 293.66, E4: 329.63, G4: 392.0, A4: 440.0,
+  C5: 523.25, D5: 587.33, E5: 659.25, G5: 783.99, A5: 880.0,
+  C6: 1046.5, E6: 1318.5,
+};
 
-/** A-minor pentatonic arpeggio notes, in Hz, across two octaves. */
-const ARP_NOTES = [220.0, 261.63, 329.63, 392.0, 440.0, 523.25, 659.25, 783.99];
-/** Pad chord roots the loop walks through (Am, F, C, G). */
-const PAD_ROOTS = [110.0, 87.31, 130.81, 98.0];
+/** The sequencer's patterns, one per mood: [bass, arpeggio] step lists. */
+const MUSIC = {
+  calm: {
+    bpm: 72,
+    bass: [NOTE.C3, 0, NOTE.G3, 0, NOTE.A3, 0, NOTE.G3, 0, NOTE.C3, 0, NOTE.G3, 0, NOTE.E3, 0, NOTE.D3, 0],
+    arp: [NOTE.C5, NOTE.E5, NOTE.G5, NOTE.E5, NOTE.A5, NOTE.G5, NOTE.E5, NOTE.C5, NOTE.D5, NOTE.E5, NOTE.G5, NOTE.A5, NOTE.G5, NOTE.E5, NOTE.D5, NOTE.C5],
+  },
+  combat: {
+    bpm: 112,
+    bass: [NOTE.C3, NOTE.C3, NOTE.G3, NOTE.C3, NOTE.A3, NOTE.A3, NOTE.G3, NOTE.E3, NOTE.C3, NOTE.C3, NOTE.G3, NOTE.C3, NOTE.D3, NOTE.D3, NOTE.G3, NOTE.G3],
+    arp: [NOTE.C5, 0, NOTE.E5, NOTE.G5, 0, NOTE.A5, NOTE.G5, NOTE.E5, NOTE.C5, 0, NOTE.E5, NOTE.G5, NOTE.A5, 0, NOTE.G5, NOTE.E5],
+  },
+  boss: {
+    bpm: 132,
+    bass: [NOTE.C3, 0, NOTE.C3, NOTE.D3, NOTE.C3, 0, NOTE.E3, NOTE.D3, NOTE.C3, 0, NOTE.C3, NOTE.D3, NOTE.G3, NOTE.E3, NOTE.D3, NOTE.D3],
+    arp: [NOTE.C5, NOTE.C5, 0, NOTE.E5, NOTE.G5, 0, NOTE.G5, NOTE.A5, NOTE.G5, NOTE.E5, 0, NOTE.D5, NOTE.E5, NOTE.G5, 0, NOTE.C6],
+  },
+};
 
 export function createAudio() {
   let context = null;
   let master = null;
-  let musicGain = null;
+  let musicBus = null;
   let muted = false;
-  let unlocked = false;
-  let lastShot = -1;
-  let lastKill = -1;
-  let lastShard = -1;
-  let musicTime = 0;
-  let nextArp = 0;
-  let nextPad = 0;
-  let arpStep = 0;
-  let padStep = 0;
-  let intensity = 'calm';
+  let mood = 'calm';
+  let step = 0;
+  let stepTimer = 0;
+  let noiseBuffer = null;
 
   function ensure() {
     if (context !== null) return true;
-    if (typeof window === 'undefined') return false;
-    const AudioContext = window.AudioContext ?? window.webkitAudioContext;
-    if (!AudioContext) return false;
+    const AudioContextClass = window.AudioContext ?? window.webkitAudioContext;
+    if (AudioContextClass === undefined) return false;
     try {
-      context = new AudioContext();
+      context = new AudioContextClass();
     } catch {
       return false;
     }
     master = context.createGain();
     master.gain.value = muted ? 0 : 0.9;
     master.connect(context.destination);
-    musicGain = context.createGain();
-    musicGain.gain.value = 0.5;
-    musicGain.connect(master);
+    musicBus = context.createGain();
+    musicBus.gain.value = 0.35;
+    musicBus.connect(master);
+    const length = context.sampleRate * 0.5;
+    noiseBuffer = context.createBuffer(1, length, context.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < length; i += 1) data[i] = Math.random() * 2 - 1;
     return true;
   }
 
-  function tone({ frequency, endFrequency, type = 'sine', duration, volume, when = 0, slide = true, destination = null }) {
+  /** Start the context after a user gesture; safe to call any time. */
+  function unlock() {
+    if (!ensure()) return;
+    if (context.state === 'suspended') void context.resume();
+  }
+
+  function tone({ frequency, endFrequency = null, type = 'sine', duration, volume, when = 0, bus = null }) {
     if (!ensure() || muted) return;
     const start = context.currentTime + when;
     const oscillator = context.createOscillator();
     const gain = context.createGain();
     oscillator.type = type;
     oscillator.frequency.setValueAtTime(frequency, start);
-    if (slide && endFrequency !== undefined) {
-      oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration);
-    }
-    gain.gain.setValueAtTime(0, start);
-    gain.gain.linearRampToValueAtTime(volume, start + 0.008);
+    if (endFrequency !== null) oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, endFrequency), start + duration);
+    gain.gain.setValueAtTime(volume, start);
     gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
     oscillator.connect(gain);
-    gain.connect(destination ?? master);
+    gain.connect(bus ?? master);
     oscillator.start(start);
-    oscillator.stop(start + duration + 0.05);
+    oscillator.stop(start + duration + 0.02);
   }
 
-  function noise({ duration, volume, filterFrequency, type = 'lowpass', when = 0, quality = 0.8 }) {
+  function noise({ duration, volume, filterFrequency = 1200, type = 'lowpass', when = 0 }) {
     if (!ensure() || muted) return;
     const start = context.currentTime + when;
-    const length = Math.max(1, Math.floor(context.sampleRate * duration));
-    const buffer = context.createBuffer(1, length, context.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let index = 0; index < length; index += 1) {
-      data[index] = (Math.random() * 2 - 1) * (1 - index / length);
-    }
     const source = context.createBufferSource();
-    source.buffer = buffer;
+    source.buffer = noiseBuffer;
+    source.loop = true;
     const filter = context.createBiquadFilter();
     filter.type = type;
     filter.frequency.value = filterFrequency;
-    filter.Q.value = quality;
     const gain = context.createGain();
     gain.gain.setValueAtTime(volume, start);
     gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
@@ -89,148 +100,61 @@ export function createAudio() {
     filter.connect(gain);
     gain.connect(master);
     source.start(start);
+    source.stop(start + duration + 0.02);
   }
 
-  function padChord(root) {
-    if (!ensure() || muted) return;
-    const start = context.currentTime + 0.05;
-    for (const ratio of [1, 1.5, 2.02]) {
-      const oscillator = context.createOscillator();
-      const gain = context.createGain();
-      oscillator.type = 'triangle';
-      oscillator.frequency.value = root * ratio;
-      oscillator.detune.value = ratio === 1 ? -4 : 4;
-      gain.gain.setValueAtTime(0, start);
-      gain.gain.linearRampToValueAtTime(0.05, start + 1.2);
-      gain.gain.linearRampToValueAtTime(0, start + 4.4);
-      oscillator.connect(gain);
-      gain.connect(musicGain);
-      oscillator.start(start);
-      oscillator.stop(start + 4.6);
-    }
-  }
-
-  function arpNote(frequency, volume) {
-    tone({ frequency, type: 'sine', duration: 0.32, volume, destination: musicGain });
-    tone({ frequency: frequency * 2, type: 'sine', duration: 0.18, volume: volume * 0.4, destination: musicGain });
+  function playStep() {
+    const pattern = MUSIC[mood];
+    const index = step % pattern.bass.length;
+    const bass = pattern.bass[index];
+    const arp = pattern.arp[index];
+    if (bass !== 0) tone({ frequency: bass, type: 'triangle', duration: 0.32, volume: 0.5, bus: musicBus });
+    if (arp !== 0) tone({ frequency: arp, type: 'sine', duration: 0.22, volume: 0.3, bus: musicBus });
+    step += 1;
   }
 
   return {
-    /** Start the context after a user gesture; safe to call often. */
-    unlock() {
-      if (!ensure()) return;
-      unlocked = true;
-      if (context.state === 'suspended') {
-        context.resume().catch(() => {});
-      }
-    },
+    unlock,
     setMuted(value) {
       muted = value;
       if (master !== null) master.gain.value = muted ? 0 : 0.9;
     },
     toggleMute() {
-      this.setMuted(!muted);
+      muted = !muted;
+      if (master !== null) master.gain.value = muted ? 0 : 0.9;
       return muted;
     },
-    get isMuted() {
-      return muted;
-    },
-    /** Advance the generative loop; `mood` is calm, combat or boss. */
-    music(dt, mood) {
-      if (!unlocked || !ensure() || muted) return;
-      intensity = mood;
-      musicTime += dt;
-      const arpGap = intensity === 'boss' ? 0.19 : intensity === 'combat' ? 0.26 : 0.52;
-      if (musicTime >= nextArp) {
-        nextArp = musicTime + arpGap;
-        const note = ARP_NOTES[arpStep % ARP_NOTES.length];
-        arpStep += intensity === 'boss' ? 3 : 1;
-        arpNote(intensity === 'boss' ? note / 2 : note, intensity === 'calm' ? 0.06 : 0.085);
+    /** Advance the sequencer; call once a frame with the frame's delta. */
+    music(dt, nextMood) {
+      if (nextMood !== mood) {
+        mood = nextMood;
+        step = 0;
+        stepTimer = 0;
       }
-      if (musicTime >= nextPad) {
-        nextPad = musicTime + 4.4;
-        padChord(PAD_ROOTS[padStep % PAD_ROOTS.length]);
-        padStep += 1;
+      if (context === null || context.state !== 'running') return;
+      stepTimer += dt;
+      const stepLength = 60 / MUSIC[mood].bpm / 2;
+      while (stepTimer >= stepLength) {
+        stepTimer -= stepLength;
+        playStep();
       }
     },
-    shoot() {
-      if (!unlocked) return;
-      const now = context ? context.currentTime : 0;
-      if (now - lastShot < SHOT_GAP) return;
-      lastShot = now;
-      tone({ frequency: 880, endFrequency: 340, type: 'square', duration: 0.07, volume: 0.05 });
-    },
-    hurt() {
-      tone({ frequency: 160, endFrequency: 60, type: 'sawtooth', duration: 0.22, volume: 0.16 });
-      noise({ duration: 0.14, volume: 0.1, filterFrequency: 700 });
-    },
-    beaconHit() {
-      tone({ frequency: 220, endFrequency: 110, type: 'triangle', duration: 0.3, volume: 0.16 });
-      tone({ frequency: 440, endFrequency: 220, type: 'sine', duration: 0.3, volume: 0.1, when: 0.02 });
-    },
-    kill() {
-      if (!unlocked) return;
-      const now = context ? context.currentTime : 0;
-      if (now - lastKill < KILL_GAP) return;
-      lastKill = now;
-      tone({ frequency: 520, endFrequency: 180, type: 'triangle', duration: 0.09, volume: 0.08 });
-      noise({ duration: 0.06, volume: 0.05, filterFrequency: 2400, type: 'highpass' });
-    },
-    shard() {
-      if (!unlocked) return;
-      const now = context ? context.currentTime : 0;
-      if (now - lastShard < SHARD_GAP) return;
-      lastShard = now;
-      tone({ frequency: 1320, endFrequency: 1760, type: 'sine', duration: 0.08, volume: 0.05 });
-    },
-    pickup() {
-      tone({ frequency: 660, type: 'sine', duration: 0.1, volume: 0.1 });
-      tone({ frequency: 990, type: 'sine', duration: 0.14, volume: 0.1, when: 0.07 });
-    },
-    levelup() {
-      for (let index = 0; index < 4; index += 1) {
-        tone({ frequency: 440 * [1, 1.25, 1.5, 2][index], type: 'triangle', duration: 0.16, volume: 0.11, when: index * 0.07 });
-      }
-    },
-    upgrade() {
-      tone({ frequency: 523, type: 'sine', duration: 0.12, volume: 0.1 });
-      tone({ frequency: 784, type: 'sine', duration: 0.18, volume: 0.1, when: 0.08 });
-    },
-    dash() {
-      noise({ duration: 0.16, volume: 0.09, filterFrequency: 1400, type: 'bandpass', quality: 1.4 });
-    },
-    nova() {
-      tone({ frequency: 180, endFrequency: 720, type: 'sine', duration: 0.3, volume: 0.12 });
-      noise({ duration: 0.25, volume: 0.07, filterFrequency: 900 });
-    },
-    explode() {
-      tone({ frequency: 120, endFrequency: 40, type: 'sawtooth', duration: 0.4, volume: 0.18 });
-      noise({ duration: 0.35, volume: 0.14, filterFrequency: 500 });
-    },
-    waveHorn() {
-      tone({ frequency: 98, type: 'triangle', duration: 0.7, volume: 0.14 });
-      tone({ frequency: 147, type: 'triangle', duration: 0.7, volume: 0.1, when: 0.12 });
-    },
-    roar() {
-      tone({ frequency: 70, endFrequency: 46, type: 'sawtooth', duration: 1.1, volume: 0.2 });
-      tone({ frequency: 93, endFrequency: 55, type: 'sawtooth', duration: 1.1, volume: 0.14, when: 0.08 });
-      noise({ duration: 0.9, volume: 0.08, filterFrequency: 300 });
-    },
-    shieldUp() {
-      tone({ frequency: 392, endFrequency: 784, type: 'sine', duration: 0.25, volume: 0.1 });
-    },
-    click() {
-      tone({ frequency: 700, type: 'sine', duration: 0.05, volume: 0.06 });
-    },
-    victory() {
-      const notes = [523, 659, 784, 1047, 784, 1047];
-      notes.forEach((frequency, index) => {
-        tone({ frequency, type: 'triangle', duration: 0.3, volume: 0.12, when: index * 0.13 });
-      });
-    },
-    gameOver() {
-      tone({ frequency: 220, endFrequency: 55, type: 'triangle', duration: 1.4, volume: 0.16 });
-      tone({ frequency: 110, endFrequency: 49, type: 'sine', duration: 1.6, volume: 0.12, when: 0.15 });
-    },
+    shoot() { tone({ frequency: 880, endFrequency: 520, type: 'square', duration: 0.07, volume: 0.08 }); },
+    hurt() { tone({ frequency: 180, endFrequency: 70, type: 'sawtooth', duration: 0.18, volume: 0.22 }); noise({ duration: 0.12, volume: 0.12, filterFrequency: 700 }); },
+    spireHit() { tone({ frequency: 240, endFrequency: 90, type: 'triangle', duration: 0.3, volume: 0.3 }); tone({ frequency: 120, endFrequency: 60, type: 'sine', duration: 0.35, volume: 0.3, when: 0.02 }); },
+    kill() { tone({ frequency: 520, endFrequency: 180, type: 'triangle', duration: 0.12, volume: 0.16 }); },
+    shard() { tone({ frequency: 1320, endFrequency: 1760, type: 'sine', duration: 0.09, volume: 0.1 }); },
+    pickup() { tone({ frequency: 660, type: 'sine', duration: 0.1, volume: 0.18 }); tone({ frequency: 990, type: 'sine', duration: 0.14, volume: 0.18, when: 0.08 }); },
+    levelup() { [523, 659, 784, 1047].forEach((f, i) => tone({ frequency: f, type: 'sine', duration: 0.16, volume: 0.2, when: i * 0.07 })); },
+    waveHorn() { tone({ frequency: 196, type: 'sawtooth', duration: 0.5, volume: 0.16 }); tone({ frequency: 294, type: 'sawtooth', duration: 0.5, volume: 0.12, when: 0.05 }); },
+    roar() { tone({ frequency: 90, endFrequency: 45, type: 'sawtooth', duration: 0.8, volume: 0.3 }); noise({ duration: 0.7, volume: 0.16, filterFrequency: 400 }); },
+    explode() { noise({ duration: 0.5, volume: 0.32, filterFrequency: 900 }); tone({ frequency: 120, endFrequency: 40, type: 'sine', duration: 0.45, volume: 0.3 }); },
+    dash() { noise({ duration: 0.16, volume: 0.14, filterFrequency: 2400, type: 'bandpass' }); },
+    nova() { tone({ frequency: 1047, endFrequency: 262, type: 'sine', duration: 0.4, volume: 0.22 }); noise({ duration: 0.3, volume: 0.12, filterFrequency: 1800 }); },
+    shieldUp() { tone({ frequency: 784, endFrequency: 1175, type: 'sine', duration: 0.2, volume: 0.16 }); },
+    click() { tone({ frequency: 740, type: 'sine', duration: 0.06, volume: 0.12 }); },
+    upgrade() { [392, 523, 659].forEach((f, i) => tone({ frequency: f, type: 'triangle', duration: 0.12, volume: 0.16, when: i * 0.06 })); },
+    gameOver() { [392, 330, 262, 196].forEach((f, i) => tone({ frequency: f, type: 'triangle', duration: 0.34, volume: 0.2, when: i * 0.22 })); },
+    victory() { [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => tone({ frequency: f, type: 'sine', duration: 0.22, volume: 0.2, when: i * 0.13 })); },
   };
 }

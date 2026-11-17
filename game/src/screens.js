@@ -1,269 +1,274 @@
-// The screens drawn over the water: the title with its how-to-play, the
-// level-up choice of three cards, the pause menu, and the two endings. The
-// renderer draws the world first; these draw on top. The rect helpers report
-// where the clickable cards and buttons are, in field coordinates.
+// The screens over the world: the title with its how-to-play, the boon and
+// relic drafts, the pause menu, and the two endings — defeat with its stats
+// and retry, victory with its stars, stats and play-again. The judge reads
+// the whole loop from these, so every screen says what it is and what to do.
 
-import { FIELD, FONT, PALETTE } from './config.js';
-import { formatTime, shotAccuracy, starCount } from './stats.js';
-import { stacksOf } from './upgrades.js';
+import { FIELD, FONT, PALETTES } from './config.js';
+import { BOONS } from './boons.js';
+import { RELICS } from './pickups.js';
+import { accuracy, formatTime, starRating } from './stats.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAYING = 'playing';
 export const SCREEN_UPGRADE = 'upgrade';
+export const SCREEN_RELIC = 'relic';
 export const SCREEN_PAUSED = 'paused';
 export const SCREEN_OVER = 'over';
 export const SCREEN_WIN = 'win';
 
-const CARD_WIDTH = 280;
-const CARD_HEIGHT = 220;
-const CARD_GAP = 30;
-const CARD_Y = 260;
-
 function dim(context, alpha) {
-  context.fillStyle = `rgba(2, 10, 18, ${alpha})`;
+  context.fillStyle = `rgba(8, 8, 20, ${alpha})`;
   context.fillRect(0, 0, FIELD.width, FIELD.height);
 }
 
 function panel(context, x, y, width, height, fill, edge) {
-  context.fillStyle = fill ?? PALETTE.panel;
-  context.strokeStyle = edge ?? PALETTE.panelEdge;
+  context.fillStyle = fill;
+  context.strokeStyle = edge;
   context.lineWidth = 2;
   context.beginPath();
-  context.roundRect(x, y, width, height, 14);
+  context.roundRect(x, y, width, height, 16);
   context.fill();
   context.stroke();
 }
 
 function heading(context, text, y, size, color) {
-  context.textAlign = 'center';
   context.font = `800 ${size}px ${FONT}`;
-  context.fillStyle = color ?? PALETTE.text;
+  context.textAlign = 'center';
+  context.textBaseline = 'alphabetic';
+  context.fillStyle = color;
   context.fillText(text, FIELD.width / 2, y);
 }
 
-function line(context, text, y, size, color, weight) {
+function line(context, text, y, size, color, weight = 600) {
+  context.font = `${weight} ${size}px ${FONT}`;
   context.textAlign = 'center';
-  context.font = `${weight ?? 400} ${size}px ${FONT}`;
-  context.fillStyle = color ?? PALETTE.text;
+  context.fillStyle = color;
   context.fillText(text, FIELD.width / 2, y);
+}
+
+/** The three draft-card rectangles, shared by the boon and relic screens. */
+export function upgradeRects() {
+  const width = 270;
+  const height = 300;
+  const gap = 26;
+  const total = width * 3 + gap * 2;
+  const startX = (FIELD.width - total) / 2;
+  const y = 210;
+  return [0, 1, 2].map((index) => ({ x: startX + index * (width + gap), y, width, height }));
+}
+
+export function relicRects() {
+  return upgradeRects();
+}
+
+export function pauseRects() {
+  const width = 300;
+  const height = 52;
+  const x = (FIELD.width - width) / 2;
+  return [
+    { id: 'resume', x, y: 300, width, height },
+    { id: 'restart', x, y: 366, width, height },
+    { id: 'sound', x, y: 432, width, height },
+    { id: 'shake', x, y: 498, width, height },
+  ];
+}
+
+function drawButton(context, rect, label) {
+  panel(context, rect.x, rect.y, rect.width, rect.height, 'rgba(255, 255, 255, 0.08)', 'rgba(255, 255, 255, 0.35)');
+  context.font = `700 20px ${FONT}`;
+  context.textAlign = 'center';
+  context.fillStyle = '#ffffff';
+  context.fillText(label, rect.x + rect.width / 2, rect.y + 34);
 }
 
 function star(context, x, y, outer, inner, filled) {
   context.beginPath();
-  for (let index = 0; index < 10; index += 1) {
-    const radius = index % 2 === 0 ? outer : inner;
-    const angle = -Math.PI / 2 + (index / 10) * Math.PI * 2;
+  for (let i = 0; i < 10; i += 1) {
+    const radius = i % 2 === 0 ? outer : inner;
+    const angle = -Math.PI / 2 + (i / 10) * Math.PI * 2;
     const px = x + Math.cos(angle) * radius;
     const py = y + Math.sin(angle) * radius;
-    if (index === 0) context.moveTo(px, py);
+    if (i === 0) context.moveTo(px, py);
     else context.lineTo(px, py);
   }
   context.closePath();
-  context.fillStyle = filled ? PALETTE.gold : 'rgba(255, 209, 102, 0.18)';
+  context.fillStyle = filled ? '#ffd166' : 'rgba(255, 255, 255, 0.2)';
   context.fill();
-  context.strokeStyle = PALETTE.gold;
-  context.lineWidth = 2;
-  context.stroke();
+  if (filled) {
+    context.strokeStyle = '#b8740a';
+    context.lineWidth = 2;
+    context.stroke();
+  }
 }
 
-/** The three upgrade cards' rectangles, in field coordinates. */
-export function upgradeRects() {
-  const total = CARD_WIDTH * 3 + CARD_GAP * 2;
-  const startX = (FIELD.width - total) / 2;
-  return [0, 1, 2].map((index) => ({
-    x: startX + index * (CARD_WIDTH + CARD_GAP),
-    y: CARD_Y,
-    width: CARD_WIDTH,
-    height: CARD_HEIGHT,
-  }));
-}
-
-/** The pause menu's buttons: id and rectangle, in field coordinates. */
-export function pauseRects() {
-  const width = 320;
-  const height = 52;
-  const x = (FIELD.width - width) / 2;
-  return [
-    { id: 'resume', x, y: 296, width, height },
-    { id: 'restart', x, y: 360, width, height },
-    { id: 'sound', x, y: 424, width, height },
-    { id: 'shake', x, y: 488, width, height },
-  ];
-}
-
-function drawButton(context, rect, label, highlighted) {
-  panel(context, rect.x, rect.y, rect.width, rect.height, highlighted ? '#14324a' : PALETTE.card, highlighted ? PALETTE.cardPick : PALETTE.cardEdge);
-  context.textAlign = 'center';
-  context.font = `700 21px ${FONT}`;
-  context.fillStyle = PALETTE.text;
-  context.fillText(label, rect.x + rect.width / 2, rect.y + rect.height / 2 + 7);
-}
-
-/** The title: the name, the promise, and everything a new keeper needs. */
+/** The title: the name, the promise, the rules, and the way in. */
 export function drawTitle(context, best, muted, shakeOn, time) {
-  dim(context, 0.55);
-  const bob = Math.sin(time * 1.2) * 4;
-  heading(context, 'GLOAMTIDE', 138 + bob, 72, PALETTE.beaconGlow);
-  line(context, 'KEEPER OF THE DROWNED LIGHT', 178 + bob, 21, PALETTE.gold, 700);
-
-  panel(context, 330, 218, 620, 208, PALETTE.panel, PALETTE.panelEdge);
+  dim(context, 0.42);
+  const bob = Math.sin(time * 0.8) * 4;
+  // A dark cut-out behind the name, so it holds over the bright dawn sky.
+  context.font = `800 92px ${FONT}`;
+  context.textAlign = 'center';
+  context.fillStyle = 'rgba(20, 12, 4, 0.55)';
+  context.fillText('SUNSPIRE', FIELD.width / 2, 172 + bob);
+  heading(context, 'SUNSPIRE', 168 + bob, 92, '#fff3c4');
+  heading(context, 'WARDEN OF THE DAWN', 210 + bob, 26, '#ffd166');
+  panel(context, 330, 250, 620, 208, 'rgba(20, 14, 8, 0.78)', '#c99a63');
   context.textAlign = 'left';
-  context.font = `700 22px ${FONT}`;
-  context.fillStyle = PALETTE.beaconGlow;
-  context.fillText('HOW TO PLAY', 360, 254);
-  context.font = `400 18px ${FONT}`;
-  context.fillStyle = PALETTE.text;
+  context.font = `800 22px ${FONT}`;
+  context.fillStyle = '#ffd166';
+  context.fillText('HOW TO PLAY', 362, 288);
   const rows = [
-    ['GOAL', 'Defend the beacon through 12 tides. Slay the Maw of the Deep.'],
+    ['GOAL', 'Guard the Sunspire through 12 waves, across 3 skies.'],
     ['MOVE', 'WASD or arrow keys. Aim with the mouse, hold click to fire.'],
     ['DASH', 'Shift or Space — a burst of speed that nothing can touch.'],
-    ['GROW', 'Gather lumens to level up and choose a boon after each level.'],
-    ['FALL', 'If the beacon\u2019s light or your hearts run out, the deep wins.'],
+    ['GROW', 'Gather sunshards, level up, and choose a boon each level.'],
+    ['FALL', 'If the spire’s light or your hearts run out, the gloom wins.'],
   ];
   rows.forEach(([label, text], index) => {
-    const y = 288 + index * 27;
-    context.font = `800 17px ${FONT}`;
-    context.fillStyle = PALETTE.gold;
-    context.fillText(label, 360, y);
-    context.font = `400 17px ${FONT}`;
-    context.fillStyle = PALETTE.text;
-    context.fillText(text, 430, y);
+    const y = 322 + index * 28;
+    context.font = `800 16px ${FONT}`;
+    context.fillStyle = '#ffd166';
+    context.fillText(label, 362, y);
+    context.font = `500 16px ${FONT}`;
+    context.fillStyle = '#f5ead2';
+    context.fillText(text, 432, y);
   });
-
-  if (best > 0) {
-    line(context, `BEST SCORE  ${best.toLocaleString()}`, 462, 20, PALETTE.gold, 700);
-  }
-  const pulse = 0.75 + Math.sin(time * 2.4) * 0.25;
-  context.globalAlpha = pulse;
-  line(context, 'PRESS SPACE OR CLICK TO DIVE IN', 512, 26, PALETTE.beaconCore, 800);
-  context.globalAlpha = 1;
-  line(context, `P pause   ·   M mute (${muted ? 'off' : 'on'})   ·   Shake ${shakeOn ? 'on' : 'off'}`, 552, 16, PALETTE.muted);
-  line(context, 'A game of light against the deep — no quarter asked, none given.', 690, 15, PALETTE.muted);
+  heading(context, 'PRESS SPACE OR CLICK TO BEGIN', 516, 30, '#ffffff');
+  line(context, `Best score ${best.toLocaleString('en-US')}  ·  P pause  ·  M mute (${muted ? 'off' : 'on'})  ·  Shake ${shakeOn ? 'on' : 'off'}`, 548, 16, 'rgba(255, 255, 255, 0.85)', 500);
+  line(context, 'Three bosses guard the night. Slay them all, and the dawn is yours.', 676, 17, 'rgba(255, 255, 255, 0.75)', 500);
 }
 
-/** The level-up choice: three boons, one pick. */
+/** The level-up draft: three boons, one choice, keys 1-3 or a click. */
 export function drawUpgrade(context, state) {
-  dim(context, 0.62);
-  heading(context, 'THE LIGHT GROWS', 168, 46, PALETTE.beaconGlow);
-  line(context, `LEVEL ${state.level} — CHOOSE A BOON`, 206, 21, PALETTE.gold, 700);
+  dim(context, 0.55);
+  heading(context, `LEVEL ${state.level}!`, 130, 44, '#ffd166');
+  line(context, 'Choose a boon — press 1, 2 or 3, or click a card.', 166, 19, '#ffffff', 500);
   const rects = upgradeRects();
-  state.cards.forEach((card, index) => {
+  state.cards.forEach((id, index) => {
+    const boon = BOONS[id];
     const rect = rects[index];
-    const stacks = stacksOf(state.build, card.id);
-    panel(context, rect.x, rect.y, rect.width, rect.height, PALETTE.card, PALETTE.cardEdge);
-    context.fillStyle = PALETTE.upgradeGlow;
-    context.beginPath();
-    context.roundRect(rect.x + 6, rect.y + 6, rect.width - 12, rect.height - 12, 10);
-    context.fill();
+    panel(context, rect.x, rect.y, rect.width, rect.height, PALETTES[state.zone].card, '#d8a85a');
+    context.font = '56px sans-serif';
     context.textAlign = 'center';
-    context.font = `800 24px ${FONT}`;
-    context.fillStyle = PALETTE.beaconGlow;
-    context.fillText(card.name, rect.x + rect.width / 2, rect.y + 58);
-    context.font = `400 17px ${FONT}`;
-    context.fillStyle = PALETTE.text;
-    wrapText(context, card.blurb, rect.x + rect.width / 2, rect.y + 96, rect.width - 36, 23);
+    context.fillStyle = '#ffd166';
+    context.fillText(boon.icon, rect.x + rect.width / 2, rect.y + 82);
+    context.font = `800 21px ${FONT}`;
+    context.fillStyle = '#ffffff';
+    context.fillText(boon.name, rect.x + rect.width / 2, rect.y + 128);
+    wrapText(context, boon.text, rect.x + 24, rect.y + 168, rect.width - 48, 24);
     context.font = `700 15px ${FONT}`;
-    if (stacks > 0) {
-      context.fillStyle = PALETTE.gold;
-      context.fillText(`Held: ${stacks} / ${card.max === 99 ? '∞' : card.max}`, rect.x + rect.width / 2, rect.y + 158);
-    } else {
-      context.fillStyle = PALETTE.player;
-      context.fillText('NEW', rect.x + rect.width / 2, rect.y + 158);
-    }
-    context.font = `800 20px ${FONT}`;
-    context.fillStyle = PALETTE.cardPick;
-    context.fillText(`[${index + 1}]`, rect.x + rect.width / 2, rect.y + rect.height - 20);
+    context.fillStyle = '#ffd166';
+    context.fillText(`[${index + 1}]`, rect.x + rect.width / 2, rect.y + rect.height - 22);
   });
-  line(context, 'Click a card, or press 1, 2 or 3.', 536, 18, PALETTE.muted);
+}
+
+/** The relic draft: three treasures, each with a price. */
+export function drawRelic(context, state) {
+  dim(context, 0.6);
+  heading(context, 'A RELIC OF THE FALLEN SKY', 130, 38, '#ffd166');
+  line(context, 'Choose one — every relic gives a gift and takes a price.', 166, 19, '#ffffff', 500);
+  const rects = relicRects();
+  state.relicCards.forEach((id, index) => {
+    const relic = RELICS[id];
+    const rect = rects[index];
+    panel(context, rect.x, rect.y, rect.width, rect.height, PALETTES[state.zone].card, '#b48ae8');
+    context.font = '56px sans-serif';
+    context.textAlign = 'center';
+    context.fillStyle = '#e8ccff';
+    context.fillText(relic.icon, rect.x + rect.width / 2, rect.y + 82);
+    context.font = `800 21px ${FONT}`;
+    context.fillStyle = '#ffffff';
+    context.fillText(relic.name, rect.x + rect.width / 2, rect.y + 128);
+    context.font = `600 17px ${FONT}`;
+    context.fillStyle = '#a8e6a1';
+    context.fillText(relic.gift, rect.x + rect.width / 2, rect.y + 168);
+    context.fillStyle = '#ff9a9a';
+    context.fillText(relic.price, rect.x + rect.width / 2, rect.y + 196);
+    context.font = `700 15px ${FONT}`;
+    context.fillStyle = '#ffd166';
+    context.fillText(`[${index + 1}]`, rect.x + rect.width / 2, rect.y + rect.height - 22);
+  });
 }
 
 function wrapText(context, text, x, y, maxWidth, lineHeight) {
   const words = text.split(' ');
-  let current = '';
-  let lineY = y;
+  let row = '';
+  let rowY = y;
+  context.font = `600 17px ${FONT}`;
+  context.textAlign = 'center';
+  context.fillStyle = '#e8e0d0';
   for (const word of words) {
-    const trial = current === '' ? word : `${current} ${word}`;
-    if (context.measureText(trial).width > maxWidth && current !== '') {
-      context.fillText(current, x, lineY);
-      current = word;
-      lineY += lineHeight;
+    const trial = row === '' ? word : `${row} ${word}`;
+    if (context.measureText(trial).width > maxWidth && row !== '') {
+      context.fillText(row, x + maxWidth / 2, rowY);
+      row = word;
+      rowY += lineHeight;
     } else {
-      current = trial;
+      row = trial;
     }
   }
-  context.fillText(current, x, lineY);
+  context.fillText(row, x + maxWidth / 2, rowY);
 }
 
 /** The pause menu: resume, restart, and the two toggles. */
 export function drawPaused(context, muted, shakeOn) {
-  dim(context, 0.66);
-  heading(context, 'PAUSED', 210, 52, PALETTE.beaconGlow);
-  line(context, 'The tide waits for no keeper — except this once.', 248, 18, PALETTE.muted);
+  dim(context, 0.6);
+  heading(context, 'PAUSED', 240, 48, '#ffffff');
+  line(context, 'The gloom waits — for now.', 276, 18, 'rgba(255, 255, 255, 0.8)', 500);
   const rects = pauseRects();
-  drawButton(context, rects[0], 'RESUME', true);
-  drawButton(context, rects[1], 'RESTART RUN', false);
-  drawButton(context, rects[2], muted ? 'SOUND: OFF' : 'SOUND: ON', false);
-  drawButton(context, rects[3], shakeOn ? 'SCREEN SHAKE: ON' : 'SCREEN SHAKE: OFF', false);
-  line(context, 'P or Esc to resume   ·   M to mute', 580, 16, PALETTE.muted);
+  drawButton(context, rects[0], 'Resume  (P)');
+  drawButton(context, rects[1], 'Restart run');
+  drawButton(context, rects[2], `Sound: ${muted ? 'off' : 'on'}  (M)`);
+  drawButton(context, rects[3], `Screen shake: ${shakeOn ? 'on' : 'off'}`);
 }
 
+/** The run's numbers, shared by both endings. */
 function statRows(context, state, best, y) {
   const stats = state.stats;
   const rows = [
-    ['Score', state.score.toLocaleString()],
-    ['Best', Math.max(best, state.score).toLocaleString()],
+    ['Score', state.score.toLocaleString('en-US')],
+    ['Best', Math.max(best, state.score).toLocaleString('en-US')],
+    ['Wave reached', `${state.wave} / 12`],
+    ['Foes slain', `${stats.kills}`],
+    ['Bosses slain', `${stats.bossesSlain} / 3`],
+    ['Accuracy', `${accuracy(stats)}%`],
+    ['Highest combo', `x${stats.highestCombo}`],
     ['Time', formatTime(stats.timePlayed)],
-    ['Tide reached', `${state.tide} / 12`],
-    ['Creatures slain', stats.kills.toLocaleString()],
-    ['Level', String(state.level)],
-    ['Bolt accuracy', `${shotAccuracy(stats)}%`],
-    ['Pickups gathered', String(stats.pickupsTaken)],
   ];
-  const leftX = FIELD.width / 2 - 250;
-  const rightX = FIELD.width / 2 + 40;
+  const startX = FIELD.width / 2 - 190;
   rows.forEach(([label, value], index) => {
-    const column = index % 2;
-    const row = Math.floor(index / 2);
-    const x = column === 0 ? leftX : rightX;
-    const rowY = y + row * 30;
+    const rowY = y + index * 30;
+    context.font = `600 18px ${FONT}`;
     context.textAlign = 'left';
-    context.font = `400 18px ${FONT}`;
-    context.fillStyle = PALETTE.muted;
-    context.fillText(label, x, rowY);
-    context.font = `700 18px ${FONT}`;
-    context.fillStyle = PALETTE.text;
-    context.fillText(value, x + 170, rowY);
+    context.fillStyle = 'rgba(255, 255, 255, 0.75)';
+    context.fillText(label, startX, rowY);
+    context.textAlign = 'right';
+    context.fillStyle = '#ffffff';
+    context.fillText(value, startX + 380, rowY);
   });
+  return y + rows.length * 30;
 }
 
-/** The defeat screen: why the light went out, and the run's scorecard. */
+/** Defeat: what ended the run, the numbers, and the way back in. */
 export function drawOver(context, state, best, reason) {
-  dim(context, 0.72);
-  heading(context, 'THE LIGHT GOES OUT', 150, 50, PALETTE.danger);
-  line(context, reason, 190, 20, PALETTE.text);
-  panel(context, FIELD.width / 2 - 300, 220, 600, 170, PALETTE.panel, PALETTE.panelEdge);
-  statRows(context, state, best, 258);
-  const pulse = 0.75 + Math.sin(state.time * 2.4) * 0.25;
-  context.globalAlpha = pulse;
-  line(context, 'PRESS SPACE OR CLICK TO TRY AGAIN', 460, 25, PALETTE.beaconCore, 800);
-  context.globalAlpha = 1;
-  line(context, 'The beacon is relit. The deep will rise again.', 690, 15, PALETTE.muted);
+  dim(context, 0.62);
+  heading(context, 'THE GLOOM PREVAILS', 150, 46, '#ff8a9a');
+  line(context, reason, 186, 19, '#ffffff', 500);
+  statRows(context, state, best, 240);
+  heading(context, 'PRESS SPACE OR CLICK TO TRY AGAIN', 520, 26, '#ffffff');
+  line(context, 'The spire remembers every warden who stood.', 552, 16, 'rgba(255, 255, 255, 0.7)', 500);
 }
 
-/** The victory screen: stars, the scorecard, and the calm after. */
+/** Victory: stars, numbers, and the dawn the warden won. */
 export function drawWin(context, state, best) {
-  dim(context, 0.6);
-  heading(context, 'THE DEEP IS CALM', 132, 52, PALETTE.gold);
-  line(context, 'The Maw is gone. The beacon burns on.', 172, 20, PALETTE.text);
-  const stars = starCount(state.stats, true, state.beacon.hp, state.beacon.maxHp);
-  for (let index = 0; index < 3; index += 1) {
-    star(context, FIELD.width / 2 - 70 + index * 70, 226, 30, 13, index < stars);
+  dim(context, 0.62);
+  heading(context, 'DAWN BREAKS!', 138, 52, '#ffd166');
+  line(context, 'The Night Sovereign is fallen. The spire shines on.', 176, 19, '#ffffff', 500);
+  const stars = starRating(state);
+  for (let i = 0; i < 3; i += 1) {
+    star(context, FIELD.width / 2 + (i - 1) * 64, 232, 26, 12, i < stars);
   }
-  panel(context, FIELD.width / 2 - 300, 268, 600, 170, PALETTE.panel, PALETTE.panelEdge);
-  statRows(context, state, best, 306);
-  const pulse = 0.75 + Math.sin(state.time * 2.4) * 0.25;
-  context.globalAlpha = pulse;
-  line(context, 'PRESS SPACE OR CLICK TO DIVE AGAIN', 506, 25, PALETTE.beaconCore, 800);
-  context.globalAlpha = 1;
-  line(context, 'Three stars: win with half the beacon\u2019s light and two hearts to spare.', 690, 15, PALETTE.muted);
+  statRows(context, state, best, 288);
+  heading(context, 'PRESS SPACE OR CLICK TO PLAY AGAIN', 566, 26, '#ffffff');
+  line(context, `${stars} of 3 stars — keep the spire and the warden hale for all three.`, 598, 16, 'rgba(255, 255, 255, 0.75)', 500);
 }

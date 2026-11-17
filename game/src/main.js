@@ -1,7 +1,9 @@
 // The boot and the frame loop: screens, sounds, announcements and the fixed
 // step. In shot mode (?shot=start|play|boss|win) it stages one scene, paints
-// twice, and raises window.__shotReady for the capture tool. In play mode it
-// runs the game: title, tides, boons, pause, and both endings.
+// twice, and raises window.__shotReady for the capture tool. In self-test
+// mode (?selftest=1) it plays a whole run with the autopilot and reports the
+// result in the page, so a headless check can read it. In play mode it runs
+// the game: title, waves, boons, relics, pause, and both endings.
 
 import { STEP } from './config.js';
 import { createRandom, randomSeed } from './random.js';
@@ -11,8 +13,12 @@ import { createAudio } from './audio.js';
 import { createParticles } from './particles.js';
 import { createWorld } from './world.js';
 import { createRenderer } from './render.js';
-import { SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAYING, SCREEN_TITLE, SCREEN_UPGRADE, SCREEN_WIN } from './screens.js';
-import { EVENT_BEACON_HIT, EVENT_DASH, EVENT_EXPLODE, EVENT_HIT, EVENT_KILL, EVENT_LEVELUP, EVENT_NOVA, EVENT_OVER, EVENT_PICKUP, EVENT_ROAR, EVENT_SHARD, EVENT_SHIELD, EVENT_SHOOT, EVENT_WAVE_CLEAR, EVENT_WAVE_START, EVENT_WIN } from './events.js';
+import { SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAYING, SCREEN_RELIC, SCREEN_TITLE, SCREEN_UPGRADE, SCREEN_WIN } from './screens.js';
+import {
+  EVENT_BOSS_DOWN, EVENT_DASH, EVENT_EXPLODE, EVENT_HIT, EVENT_KILL, EVENT_LEVELUP, EVENT_NOVA,
+  EVENT_OVER, EVENT_PICKUP, EVENT_RELIC, EVENT_ROAR, EVENT_SHARD, EVENT_SHIELD, EVENT_SHOOT,
+  EVENT_SPIRE_HIT, EVENT_WAVE_CLEAR, EVENT_WAVE_START, EVENT_WIN, EVENT_ZONE,
+} from './events.js';
 import { stageShot } from './shots.js';
 
 const canvas = document.getElementById('game');
@@ -33,6 +39,8 @@ let muted = readMuted();
 let shakeOn = readShakeOn();
 let reason = '';
 let announceTimer = 0;
+let endShownAtMs = 0;
+let aimLocked = false;
 
 audio.setMuted(muted);
 
@@ -53,7 +61,7 @@ function startRun() {
   screen = SCREEN_PLAYING;
   input.flush();
   playEvents(events);
-  announce('Playing: defend the beacon through 12 tides.');
+  announce('Playing: guard the Sunspire through 12 waves.');
 }
 
 function showTitle() {
@@ -61,13 +69,13 @@ function showTitle() {
   world.seedAttract();
   screen = SCREEN_TITLE;
   input.flush();
-  announce('Gloamtide. Press Space or click to dive in.');
+  announce('Sunspire. Press Space or click to begin.');
 }
 
 function playEvents(events) {
   if (events & EVENT_SHOOT) audio.shoot();
   if (events & EVENT_HIT) audio.hurt();
-  if (events & EVENT_BEACON_HIT) audio.beaconHit();
+  if (events & EVENT_SPIRE_HIT) audio.spireHit();
   if (events & EVENT_KILL) audio.kill();
   if (events & EVENT_SHARD) audio.shard();
   if (events & EVENT_PICKUP) audio.pickup();
@@ -81,6 +89,9 @@ function playEvents(events) {
   if (events & EVENT_SHIELD) audio.shieldUp();
   if (events & EVENT_OVER) audio.gameOver();
   if (events & EVENT_WIN) audio.victory();
+  if (events & EVENT_RELIC) audio.upgrade();
+  if (events & EVENT_BOSS_DOWN) audio.victory();
+  if (events & EVENT_ZONE) audio.waveHorn();
 }
 
 function musicMood() {
@@ -110,33 +121,44 @@ function handlePlaying(actions) {
   }
 }
 
-function handleUpgrade(clicks) {
+function handleDraft(clicks, rects, choose) {
   const pick = input.takeUpgradePick();
   if (pick >= 0) {
-    chooseCard(pick);
+    choose(pick);
     return;
   }
-  const rects = renderer.upgradeRects();
   for (const click of clicks) {
     for (let index = 0; index < rects.length; index += 1) {
       if (inside(rects[index], click)) {
-        chooseCard(index);
+        choose(index);
         return;
       }
     }
   }
 }
 
-function chooseCard(index) {
-  if (!world.chooseUpgrade(index)) return;
-  audio.upgrade();
-  if (state.phase !== 'levelup') {
+function handleUpgrade(clicks) {
+  handleDraft(clicks, renderer.upgradeRects(), (index) => {
+    if (!world.chooseUpgrade(index)) return;
+    audio.upgrade();
+    if (state.phase !== 'levelup') {
+      screen = SCREEN_PLAYING;
+      input.flush();
+      announce(`Playing: level ${state.level}.`);
+    } else {
+      announce(`Level ${state.level}: choose another boon.`);
+    }
+  });
+}
+
+function handleRelic(clicks) {
+  handleDraft(clicks, renderer.relicRects(), (index) => {
+    if (!world.chooseRelic(index)) return;
+    audio.upgrade();
     screen = SCREEN_PLAYING;
     input.flush();
-    announce(`Playing: level ${state.level}.`);
-  } else {
-    announce(`Level ${state.level}: choose another boon.`);
-  }
+    announce('Playing: the relic is yours.');
+  });
 }
 
 function handlePaused(actions, clicks) {
@@ -179,9 +201,12 @@ function handleEnd(actions, clicks) {
   }
 }
 
-let endShownAtMs = 0;
-
 function drawFrame() {
+  if (!aimLocked) {
+    const aim = input.aim();
+    state.aimX = aim.x;
+    state.aimY = aim.y;
+  }
   renderer.draw(state, screen, {
     best,
     muted,
@@ -192,25 +217,47 @@ function drawFrame() {
 }
 
 function runShot(name) {
-  screen = stageShot(name, world);
+  aimLocked = true;
+  try {
+    screen = stageShot(name, world);
+  } catch (error) {
+    document.title = `SHOT-ERROR: ${error.message}`;
+    announce(`Shot staging failed: ${error.message}`);
+    screen = SCREEN_TITLE;
+  }
   if (screen === SCREEN_TITLE) {
-    announce('Gloamtide. Press Space or click to dive in.');
+    announce('Sunspire. Press Space or click to begin.');
   } else if (screen === SCREEN_WIN) {
     saveBestIfBeaten();
-    announce('Victory: the deep is calm.');
+    announce('Victory: dawn breaks.');
   } else {
-    announce('Playing: defend the beacon through 12 tides.');
+    announce('Playing: guard the Sunspire through 12 waves.');
   }
   drawFrame();
   drawFrame();
   window.__shotReady = true;
 }
 
+function runSelfTest() {
+  // Play a whole run with the autopilot, through the shot stager's win path,
+  // and leave the verdict in the page for a headless check to read.
+  try {
+    const staged = stageShot('win', world);
+    const ok = staged === SCREEN_WIN && state.won && state.wave >= 12;
+    document.title = ok ? 'SELFTEST-PASS' : 'SELFTEST-FAIL';
+    announce(`selftest ${ok ? 'PASS' : 'FAIL'}: wave=${state.wave} won=${state.won} score=${state.score} kills=${state.stats.kills} bosses=${state.stats.bossesSlain} level=${state.level}`);
+    window.__shotReady = true;
+  } catch (error) {
+    document.title = `SELFTEST-ERROR: ${error.message}`;
+    announce(`selftest ERROR: ${error.message}`);
+  }
+  drawFrame();
+}
+
 function runGame() {
   showTitle();
   let last = performance.now();
   let accumulator = 0;
-  let hitStopLeft = 0;
 
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAYING) {
@@ -235,6 +282,7 @@ function runGame() {
     if (screen === SCREEN_TITLE) handleTitle(actions, clicks);
     else if (screen === SCREEN_PLAYING) handlePlaying(actions);
     else if (screen === SCREEN_UPGRADE) handleUpgrade(clicks);
+    else if (screen === SCREEN_RELIC) handleRelic(clicks);
     else if (screen === SCREEN_PAUSED) handlePaused(actions, clicks);
     else handleEnd(actions, clicks);
 
@@ -262,8 +310,14 @@ function runGame() {
           announce(`Level ${state.level}: choose a boon.`);
           break;
         }
+        if (events & EVENT_RELIC) {
+          screen = SCREEN_RELIC;
+          input.flush();
+          announce('A relic of the fallen sky: choose one.');
+          break;
+        }
         if (events & EVENT_OVER) {
-          reason = state.beacon.hp <= 0 ? 'The beacon\u2019s light was snuffed out.' : 'The keeper fell beneath the tide.';
+          reason = state.spire.hp <= 0 ? 'The spire’s light was snuffed out.' : 'The warden fell beneath the gloom.';
           saveBestIfBeaten();
           screen = SCREEN_OVER;
           endShownAtMs = performance.now();
@@ -284,7 +338,7 @@ function runGame() {
       announceTimer += frameDt;
       if (announceTimer > 5) {
         announceTimer = 0;
-        announce(`Playing: tide ${state.tide} of 12, score ${state.score}, beacon ${Math.ceil(state.beacon.hp)}.`);
+        announce(`Playing: wave ${state.wave} of 12, score ${state.score}, spire ${Math.ceil(state.spire.hp)}.`);
       }
     }
 
@@ -296,7 +350,9 @@ function runGame() {
 }
 
 const shot = params.get('shot');
-if (shot !== null) {
+if (params.has('selftest')) {
+  runSelfTest();
+} else if (shot !== null) {
   runShot(shot);
 } else {
   runGame();

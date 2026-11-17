@@ -1,47 +1,49 @@
-// The run's own scorecard: everything the end screens report, and the stars a
-// victory earns. Stars are about how cleanly the light was kept, not about
-// speed: one for winning, one for keeping half the beacon's light, one for
-// never letting the keeper fall below two hearts.
+// The run's scorecard: everything the victory and defeat screens report,
+// and everything the star rating weighs. Kept apart from the world so the
+// numbers stay honest no matter how the run ends.
 
-export function createRunStats() {
+/** A fresh, empty scorecard. */
+export function createStats() {
   return {
     kills: 0,
+    elitesSlain: 0,
+    bossesSlain: 0,
     shotsFired: 0,
     shotsHit: 0,
     damageDealt: 0,
     pickupsTaken: 0,
     dashesUsed: 0,
     levelsGained: 0,
-    elitesSlain: 0,
-    lowestKeeperHp: 99,
-    lowestBeaconHp: 99,
+    relicsTaken: 0,
+    shardsGathered: 0,
+    highestCombo: 1,
+    lowestWardenHp: 5,
+    lowestSpireHp: 150,
     timePlayed: 0,
   };
 }
 
-/** Whole-percent accuracy of the keeper's bolts (0 when nothing was fired). */
-export function shotAccuracy(stats) {
-  if (stats.shotsFired <= 0) return 0;
-  return Math.round((stats.shotsHit / stats.shotsFired) * 100);
+/** Accuracy as a whole percent, safe when nothing was fired. */
+export function accuracy(stats) {
+  if (stats.shotsFired === 0) return 0;
+  return Math.round((100 * stats.shotsHit) / stats.shotsFired);
 }
 
-/** Stars for a finished run: 0 without a victory, otherwise 1 to 3. */
-export function starCount(stats, won, beaconHp, beaconMaxHp) {
-  if (!won) return 0;
-  let stars = 1;
-  if (beaconHp >= beaconMaxHp / 2) stars += 1;
-  if (stats.lowestKeeperHp >= 2) stars += 1;
-  return stars;
-}
-
-/** A run's length as M:SS, or H:MM:SS for the rare hour-long night. */
+/** A run time as M:SS, for the end screens. */
 export function formatTime(seconds) {
-  const total = Math.max(0, Math.floor(seconds));
-  const minutes = Math.floor(total / 60);
-  const rest = total % 60;
-  const paddedRest = rest < 10 ? `0${rest}` : `${rest}`;
-  if (minutes < 60) return `${minutes}:${paddedRest}`;
-  const hours = Math.floor(minutes / 60);
-  const paddedMinutes = minutes % 60 < 10 ? `0${minutes % 60}` : `${minutes % 60}`;
-  return `${hours}:${paddedMinutes}:${paddedRest}`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.floor(seconds % 60).toString().padStart(2, '0');
+  return `${minutes}:${rest}`;
+}
+
+/**
+ * The victory star rating, 1 to 3: one star for finishing, one for keeping
+ * the spire above half, one for keeping the warden above half. A flawless
+ * run earns all three.
+ */
+export function starRating(state) {
+  let stars = 1;
+  if (state.stats.lowestSpireHp >= state.spire.maxHp * 0.5) stars += 1;
+  if (state.stats.lowestWardenHp >= Math.ceil(state.player.maxHp / 2)) stars += 1;
+  return stars;
 }

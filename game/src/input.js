@@ -1,13 +1,14 @@
-// Keyboard and mouse, read as one input: a movement vector, an aim point in
-// field coordinates, whether the trigger is held, and the edge-triggered
-// actions (confirm, pause, mute, dash) and clicks the screens consume. Keys
-// the game uses never scroll the page. Pointer events cover mouse and touch
-// alike; the game itself is tuned for keyboard and mouse.
+// Keyboard and mouse, reduced to the game's own questions: which way to
+// move, where to aim, whether to fire or dash, and the one-shot actions
+// (confirm, pause, mute, card picks). The autopilot speaks this same
+// interface, so screenshot scenes play through the real input path.
 
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
 export const ACTION_MUTE = 4;
+export const ACTION_DASH = 8;
 
+/** Keys that move the warden, in field space. */
 const MOVE_KEYS = {
   KeyW: [0, -1],
   ArrowUp: [0, -1],
@@ -19,25 +20,24 @@ const MOVE_KEYS = {
   ArrowRight: [1, 0],
 };
 
+/**
+ * @param {HTMLCanvasElement} canvas the game canvas, for mouse coordinates
+ * @param {(clientX: number, clientY: number) => {x: number, y: number}} toField
+ *   converts a mouse position to field coordinates
+ */
 export function createInput(canvas, toField) {
-  const pressed = new Set();
-  const clicks = [];
-  const upgradePicks = [];
+  const held = new Set();
   let actions = 0;
+  let clicks = [];
+  let upgradePick = -1;
+  let mouse = { x: 640, y: 200 };
+  let firing = false;
   let dashQueued = false;
-  let pointerDown = false;
-  let pointerX = 0;
-  let pointerY = 0;
-
-  function fieldPoint(event) {
-    const rect = canvas.getBoundingClientRect();
-    return toField(event.clientX - rect.left, event.clientY - rect.top);
-  }
 
   function onKeyDown(event) {
     if (event.repeat) return;
     if (MOVE_KEYS[event.code] !== undefined) {
-      pressed.add(event.code);
+      held.add(event.code);
       event.preventDefault();
       return;
     }
@@ -45,117 +45,110 @@ export function createInput(canvas, toField) {
       actions |= ACTION_CONFIRM;
       dashQueued = true;
       event.preventDefault();
-      return;
-    }
-    if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
+    } else if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
       dashQueued = true;
       event.preventDefault();
-      return;
-    }
-    if (event.code === 'KeyP' || event.code === 'Escape') {
+    } else if (event.code === 'KeyP' || event.code === 'Escape') {
       actions |= ACTION_PAUSE;
-      event.preventDefault();
-      return;
-    }
-    if (event.code === 'KeyM') {
+    } else if (event.code === 'KeyM') {
       actions |= ACTION_MUTE;
-      return;
-    }
-    if (event.code === 'Digit1' || event.code === 'Digit2' || event.code === 'Digit3') {
-      upgradePicks.push(Number(event.code.slice(-1)) - 1);
+    } else if (event.code === 'Digit1' || event.code === 'Digit2' || event.code === 'Digit3') {
+      upgradePick = Number(event.code.slice(-1)) - 1;
     }
   }
 
   function onKeyUp(event) {
-    pressed.delete(event.code);
+    held.delete(event.code);
   }
 
-  function onPointerDown(event) {
-    const point = fieldPoint(event);
-    pointerX = point.x;
-    pointerY = point.y;
-    pointerDown = true;
-    clicks.push({ x: point.x, y: point.y });
-    try {
-      canvas.setPointerCapture?.(event.pointerId);
-    } catch {
-      // Capture can fail for a pointer that is already gone; the game plays on.
+  function onMouseMove(event) {
+    mouse = toField(event.clientX, event.clientY);
+  }
+
+  function onMouseDown(event) {
+    mouse = toField(event.clientX, event.clientY);
+    if (event.button === 0) {
+      firing = true;
+      clicks.push({ ...mouse });
     }
   }
 
-  function onPointerMove(event) {
-    const point = fieldPoint(event);
-    pointerX = point.x;
-    pointerY = point.y;
-  }
-
-  function onPointerUp() {
-    pointerDown = false;
+  function onMouseUp(event) {
+    if (event.button === 0) firing = false;
   }
 
   function onBlur() {
-    pressed.clear();
-    pointerDown = false;
+    // Losing the window drops everything queued, so a click or dash from
+    // before the blur can never fire on the way back in.
+    held.clear();
+    firing = false;
+    actions = 0;
+    clicks = [];
+    upgradePick = -1;
+    dashQueued = false;
   }
 
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('blur', onBlur);
-  canvas.addEventListener('pointerdown', onPointerDown);
-  canvas.addEventListener('pointermove', onPointerMove);
-  canvas.addEventListener('pointerup', onPointerUp);
-  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('mousemove', onMouseMove);
+  canvas.addEventListener('mousedown', onMouseDown);
+  window.addEventListener('mouseup', onMouseUp);
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
   return {
-    /** The movement vector from the held keys, normalised, or zero. */
+    /** The normalised move direction from the held keys. */
     move() {
       let x = 0;
       let y = 0;
-      for (const code of pressed) {
-        const step = MOVE_KEYS[code];
-        if (step !== undefined) {
-          x += step[0];
-          y += step[1];
+      for (const code of held) {
+        const dir = MOVE_KEYS[code];
+        if (dir !== undefined) {
+          x += dir[0];
+          y += dir[1];
         }
       }
       const length = Math.hypot(x, y);
       if (length === 0) return { x: 0, y: 0 };
       return { x: x / length, y: y / length };
     },
-    /** The aim point in field coordinates: where the pointer is. */
+    /** The aim point, in field coordinates. */
     aim() {
-      return { x: pointerX, y: pointerY };
+      return { ...mouse };
     },
     get firing() {
-      return pointerDown;
+      return firing;
     },
-    /** Actions raised since the last read, as a bit mask (then cleared). */
+    /** Whether a dash was requested since the last step; consumed on read. */
+    takeDash() {
+      const queued = dashQueued;
+      dashQueued = false;
+      return queued;
+    },
+    /** One-shot actions since the last read; consumed on read. */
     takeActions() {
       const taken = actions;
       actions = 0;
       return taken;
     },
-    /** Clicks since the last read, in field coordinates (then cleared). */
+    /** Clicks since the last read, in field coordinates; consumed on read. */
     takeClicks() {
-      return clicks.splice(0, clicks.length);
-    },
-    /** The oldest upgrade pick (0, 1 or 2), or -1 when none was pressed. */
-    takeUpgradePick() {
-      return upgradePicks.length > 0 ? upgradePicks.shift() : -1;
-    },
-    /** True once when the dash key was pressed since the last read. */
-    takeDash() {
-      const taken = dashQueued;
-      dashQueued = false;
+      const taken = clicks;
+      clicks = [];
       return taken;
     },
-    /** Forget held keys and clicks (used when the screen changes). */
+    /** A 1/2/3 card pick since the last read, or -1; consumed on read. */
+    takeUpgradePick() {
+      const taken = upgradePick;
+      upgradePick = -1;
+      return taken;
+    },
+    /** Drop every queued action, click and dash (used on screen changes). */
     flush() {
       actions = 0;
+      clicks = [];
+      upgradePick = -1;
       dashQueued = false;
-      clicks.length = 0;
-      upgradePicks.length = 0;
     },
   };
 }

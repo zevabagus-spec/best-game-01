@@ -1,199 +1,241 @@
-// The creatures of the deep: their pool, their spawning, and how each kind
-// swims. Drifters pulse toward the beacon, darts streak in, spitters hold
-// their range and fire globs, brutes crawl forward unstoppably, splitters
-// burst into motes, stalkers hunt the keeper, and wraiths phase in and out of
-// the water itself. Collisions and deaths live in the world; this file only
-// moves creatures and lets spitters shoot.
+// The gloom's creatures: ten kinds, each with its own shape, speed and
+// appetite, plus gilded elites that hit harder and drop pickups. Enemies live
+// in one pool, allocated once; spawning takes a free slot, death returns it.
 
-import { BEACON, ENEMY, FIELD } from './config.js';
+import { ENEMY, FIELD, POOLS, SPIRE } from './config.js';
+import { EVENT_EXPLODE, EVENT_KILL } from './events.js';
+import { greedBonus } from './boons.js';
+import { spawnPickup } from './pickups.js';
 
-function blankEnemy() {
+/** A blank enemy slot, filled in by spawnEnemy. */
+function makeEnemy() {
   return {
-    active: false, kind: 'drifter', id: 0, x: 0, y: 0, vx: 0, vy: 0,
-    hp: 1, maxHp: 1, radius: 10, speed: 50, elite: false,
-    wobble: 0, fireTimer: 0, phaseTimer: 0, phased: false,
-    flash: 0, orbCd: 0, touchCd: 0, knockX: 0, knockY: 0,
+    active: false, kind: 'wisp', x: 0, y: 0, vx: 0, vy: 0,
+    hp: 1, maxHp: 1, radius: 10, speed: 50,
+    elite: false, flash: 0, spawnT: 0, seed: 0,
+    fireTimer: 0, phaseT: 0, phased: false, orbHitT: 0, weaveT: 0,
   };
 }
 
-/** The fixed pool of creatures, allocated once at boot. */
-export function createEnemyPool(capacity) {
-  const pool = [];
-  for (let index = 0; index < capacity; index += 1) pool.push(blankEnemy());
-  return pool;
+/** The enemy pool: fixed slots, reused for the whole run. */
+export function createEnemyPool() {
+  return Array.from({ length: POOLS.enemies }, makeEnemy);
 }
 
-/** How many creatures are swimming right now. */
+/** How many enemies are currently alive. */
 export function countActive(pool) {
   let count = 0;
-  for (let index = 0; index < pool.length; index += 1) {
-    if (pool[index].active) count += 1;
-  }
+  for (const enemy of pool) if (enemy.active) count += 1;
   return count;
 }
 
-/** Wake one creature of a kind at a point; returns it, or null when full. */
+/**
+ * Wake one slot as a creature of `kind` at (x, y). `hpScale` grows with the
+ * wave; elites are bigger, tougher and worth more. Returns the enemy, or null
+ * when the pool is full.
+ */
 export function spawnEnemy(pool, kind, x, y, hpScale, elite, time) {
-  const definition = ENEMY[kind];
-  for (let index = 0; index < pool.length; index += 1) {
-    const enemy = pool[index];
+  const def = ENEMY[kind];
+  for (const enemy of pool) {
     if (enemy.active) continue;
     enemy.active = true;
     enemy.kind = kind;
-    enemy.id = index;
     enemy.x = x;
     enemy.y = y;
     enemy.vx = 0;
     enemy.vy = 0;
-    enemy.maxHp = Math.round(definition.hp * hpScale * (elite ? 3 : 1));
+    enemy.maxHp = Math.round(def.hp * hpScale * (elite ? 3.2 : 1));
     enemy.hp = enemy.maxHp;
-    enemy.radius = definition.radius * (elite ? 1.35 : 1);
-    enemy.speed = definition.speed * (elite ? 0.92 : 1);
+    enemy.radius = def.radius * (elite ? 1.35 : 1);
+    enemy.speed = def.speed * (elite ? 1.1 : 1) * (0.9 + Math.random() * 0.2);
     enemy.elite = elite;
-    enemy.wobble = time * 2 + index;
-    enemy.fireTimer = 1.2 + (index % 5) * 0.3;
-    enemy.phaseTimer = 2.2;
-    enemy.phased = false;
     enemy.flash = 0;
-    enemy.orbCd = 0;
-    enemy.touchCd = 0;
-    enemy.knockX = 0;
-    enemy.knockY = 0;
+    enemy.spawnT = 0.45;
+    enemy.seed = time + Math.random() * 10;
+    enemy.fireTimer = 1 + Math.random();
+    enemy.phaseT = 2 + Math.random() * 2;
+    enemy.phased = false;
+    enemy.orbHitT = 0;
+    enemy.weaveT = 4;
     return enemy;
   }
   return null;
 }
 
-/** A point on a random edge of the field, where creatures rise. */
-export function edgeSpawnPoint(random) {
-  const side = random.int(4);
-  const margin = 24;
-  if (side === 0) return { x: random.range(margin, FIELD.width - margin), y: margin };
-  if (side === 1) return { x: random.range(margin, FIELD.width - margin), y: FIELD.height - margin };
-  if (side === 2) return { x: margin, y: random.range(margin, FIELD.height - margin) };
-  return { x: FIELD.width - margin, y: random.range(margin, FIELD.height - margin) };
-}
-
-/** What a splitter leaves behind: two motes bursting outward. */
-export function burstSplitter(state, enemy) {
-  for (let index = 0; index < 2; index += 1) {
-    const angle = state.random.range(0, Math.PI * 2);
-    const mote = spawnEnemy(state.enemies, 'mote', enemy.x, enemy.y, state.hpScale, false, state.time);
+/** Split a splitter's death into three motes that scatter outward. */
+function scatterMotes(state, enemy) {
+  for (let i = 0; i < 3; i += 1) {
+    const angle = (i / 3) * Math.PI * 2 + enemy.seed;
+    const mote = spawnEnemy(state.enemies, 'mote', enemy.x + Math.cos(angle) * 14, enemy.y + Math.sin(angle) * 14, state.hpScale, false, state.time);
     if (mote !== null) {
-      mote.knockX = Math.cos(angle) * 190;
-      mote.knockY = Math.sin(angle) * 190;
+      mote.vx = Math.cos(angle) * 190;
+      mote.vy = Math.sin(angle) * 190;
     }
   }
 }
 
-function steerToward(enemy, targetX, targetY, speed, dt) {
-  const dx = targetX - enemy.x;
-  const dy = targetY - enemy.y;
-  const distance = Math.hypot(dx, dy) || 1;
-  enemy.vx = (dx / distance) * speed;
-  enemy.vy = (dy / distance) * speed;
+/**
+ * Hurt an enemy. Returns event bits. On death: score and combo, sunshards,
+ * particles, a floating number, and — for splitters and elites — what the
+ * death leaves behind.
+ */
+export function damageEnemy(state, enemy, damage, knockX, knockY, isCrit) {
+  let events = 0;
+  enemy.hp -= damage;
+  enemy.flash = 0.09;
+  enemy.vx += knockX;
+  enemy.vy += knockY;
+  state.stats.damageDealt += damage;
+  if (enemy.hp > 0) return events;
+  enemy.active = false;
+  const def = ENEMY[enemy.kind];
+  const mult = state.combo.mult;
+  const greed = state.relics.includes('greed') ? 1.5 : 1;
+  const points = Math.round(def.score * mult * (enemy.elite ? 3 : 1) * greedBonus(state) * greed);
+  state.score += points;
+  state.stats.kills += 1;
+  state.combo.kills += 1;
+  state.combo.timer = 4;
+  if (state.combo.kills % 8 === 0 && mult < 5) {
+    state.combo.mult = Math.min(5, mult + 1);
+    state.particles.float(enemy.x, enemy.y - 20, `COMBO x${state.combo.mult}!`, '#ffd166', 20);
+  }
+  state.stats.highestCombo = Math.max(state.stats.highestCombo, state.combo.mult);
+  state.particles.burst(enemy.x, enemy.y, enemy.elite ? 26 : 12, enemy.elite ? '#ffd166' : '#b8a8e8', enemy.elite ? 300 : 220, 0.55, 3);
+  state.particles.float(enemy.x, enemy.y - 8, `+${points}`, isCrit ? '#ffd166' : '#ffffff', isCrit ? 18 : 14);
+  const shards = def.xp * (enemy.elite ? 3 : 1);
+  for (let i = 0; i < shards; i += 1) {
+    const angle = Math.random() * Math.PI * 2;
+    spawnShard(state, enemy.x + Math.cos(angle) * 10, enemy.y + Math.sin(angle) * 10);
+  }
+  if (enemy.kind === 'splitter') scatterMotes(state, enemy);
+  if (enemy.elite) {
+    state.stats.elitesSlain += 1;
+    state.hitStop = Math.max(state.hitStop, 0.06);
+    state.shake = Math.max(state.shake, 5);
+    spawnPickup(state, enemy.x, enemy.y, state.random.pick(['heart', 'magnet', 'shield', 'bomb']));
+  } else if (state.random.chance(0.012)) {
+    spawnPickup(state, enemy.x, enemy.y, state.random.pick(['heart', 'magnet', 'shield', 'bomb']));
+  }
+  events |= EVENT_KILL;
+  if (enemy.kind === 'brute' || enemy.kind === 'bulwark') events |= EVENT_EXPLODE;
+  return events;
 }
 
-/** One step of creature movement and spitter fire for the whole pool. */
+/** Drop one sunshard into the shard pool. */
+export function spawnShard(state, x, y) {
+  for (const shard of state.shards) {
+    if (shard.active) continue;
+    shard.active = true;
+    shard.x = x;
+    shard.y = y;
+    shard.vx = (Math.random() - 0.5) * 90;
+    shard.vy = (Math.random() - 0.5) * 90;
+    shard.life = 30;
+    shard.seed = Math.random() * 10;
+    return;
+  }
+}
+
+/** Move and think every live enemy for one step. */
 export function updateEnemies(state, dt) {
   const player = state.player;
-  const time = state.time;
-  for (let index = 0; index < state.enemies.length; index += 1) {
-    const enemy = state.enemies[index];
+  for (const enemy of state.enemies) {
     if (!enemy.active) continue;
     enemy.flash = Math.max(0, enemy.flash - dt);
-    enemy.orbCd = Math.max(0, enemy.orbCd - dt);
-    enemy.touchCd = Math.max(0, enemy.touchCd - dt);
-    const wobble = Math.sin(time * 2.2 + enemy.wobble) * 0.45;
+    enemy.spawnT = Math.max(0, enemy.spawnT - dt);
+    enemy.orbHitT = Math.max(0, enemy.orbHitT - dt);
+    const def = ENEMY[enemy.kind];
 
+    // Wraiths blink in and out of the world: untouchable while phased.
     if (enemy.kind === 'wraith') {
-      enemy.phaseTimer -= dt;
-      if (enemy.phaseTimer <= 0) {
+      enemy.phaseT -= dt;
+      if (enemy.phaseT <= 0) {
         enemy.phased = !enemy.phased;
-        enemy.phaseTimer = enemy.phased ? 1.4 : 2.2;
+        enemy.phaseT = enemy.phased ? 1.1 : 2.2 + Math.random();
+        if (enemy.phased) state.particles.burst(enemy.x, enemy.y, 6, '#a89af0', 120, 0.4, 2);
       }
     }
 
-    const speed = enemy.speed * (enemy.phased ? 1.4 : 1);
-    if (enemy.kind === 'stalker') {
-      steerToward(enemy, player.x, player.y, speed, dt);
-    } else if (enemy.kind === 'spitter') {
-      const dx = BEACON.x - enemy.x;
-      const dy = BEACON.y - enemy.y;
+    let targetX = SPIRE.x;
+    let targetY = SPIRE.y;
+    if (def.target === 'player') {
+      targetX = player.x;
+      targetY = player.y;
+    } else if (def.target === 'range') {
+      // Spitters and weavers hold a firing distance from the spire.
+      const dx = enemy.x - SPIRE.x;
+      const dy = enemy.y - SPIRE.y;
       const distance = Math.hypot(dx, dy) || 1;
-      if (distance > 300) {
-        steerToward(enemy, BEACON.x, BEACON.y, speed, dt);
-      } else if (distance < 210) {
-        enemy.vx = (-dx / distance) * speed * 0.8;
-        enemy.vy = (-dy / distance) * speed * 0.8;
-      } else {
-        // Hold range and strafe around the beacon.
-        enemy.vx = (-dy / distance) * speed * 0.55;
-        enemy.vy = (dx / distance) * speed * 0.55;
-      }
-      enemy.fireTimer -= dt;
-      if (enemy.fireTimer <= 0) {
-        enemy.fireTimer = 3.4;
-        fireGlob(state, enemy);
-      }
-    } else {
-      steerToward(enemy, BEACON.x, BEACON.y, speed, dt);
+      const hold = 300;
+      const radial = distance > hold + 40 ? -1 : distance < hold - 40 ? 1 : 0;
+      targetX = enemy.x + (dx / distance) * radial * 60 + -dy / distance * 40;
+      targetY = enemy.y + (dy / distance) * radial * 60 + dx / distance * 40;
     }
+    const dx = targetX - enemy.x;
+    const dy = targetY - enemy.y;
+    const distance = Math.hypot(dx, dy) || 1;
+    // A gentle wobble, so the swarm never marches in straight lines.
+    const wobble = Math.sin(state.time * 2.2 + enemy.seed) * 0.35;
+    const nx = dx / distance;
+    const ny = dy / distance;
+    const steerX = nx - ny * wobble;
+    const steerY = ny + nx * wobble;
+    const steerLength = Math.hypot(steerX, steerY) || 1;
+    enemy.vx += ((steerX / steerLength) * enemy.speed - enemy.vx) * Math.min(1, 3 * dt);
+    enemy.vy += ((steerY / steerLength) * enemy.speed - enemy.vy) * Math.min(1, 3 * dt);
+    enemy.x += enemy.vx * dt;
+    enemy.y += enemy.vy * dt;
+    enemy.x = Math.max(16, Math.min(FIELD.width - 16, enemy.x));
+    enemy.y = Math.max(16, Math.min(FIELD.height - 16, enemy.y));
 
-    // A sideways wobble, so the swarm never marches in straight lines.
-    const sideX = -enemy.vy;
-    const sideY = enemy.vx;
-    const sideLength = Math.hypot(sideX, sideY) || 1;
-    enemy.x += (enemy.vx + (sideX / sideLength) * wobble * 30 + enemy.knockX) * dt;
-    enemy.y += (enemy.vy + (sideY / sideLength) * wobble * 30 + enemy.knockY) * dt;
-    enemy.knockX *= Math.max(0, 1 - 6 * dt);
-    enemy.knockY *= Math.max(0, 1 - 6 * dt);
-    enemy.x = Math.max(8, Math.min(FIELD.width - 8, enemy.x));
-    enemy.y = Math.max(8, Math.min(FIELD.height - 8, enemy.y));
+    // Spitters lob gloom globs at the spire; weavers spin new motes.
+    if (enemy.kind === 'spitter') {
+      enemy.fireTimer -= dt;
+      if (enemy.fireTimer <= 0 && !enemy.phased) {
+        enemy.fireTimer = 2.6 + Math.random() * 0.8;
+        fireGlob(state, enemy.x, enemy.y, SPIRE.x, SPIRE.y, 170, 3);
+      }
+    }
+    if (enemy.kind === 'weaver') {
+      enemy.weaveT -= dt;
+      if (enemy.weaveT <= 0) {
+        enemy.weaveT = 5.5;
+        const mote = spawnEnemy(state.enemies, 'mote', enemy.x, enemy.y, state.hpScale, false, state.time);
+        if (mote !== null) state.particles.burst(enemy.x, enemy.y, 8, '#6ad8c8', 140, 0.4, 2);
+      }
+    }
   }
-  separateEnemies(state.enemies);
 }
 
-/** A spitter's glob: a slow, arcing shot aimed at the beacon. */
-function fireGlob(state, enemy) {
-  const glob = state.enemyShots.find((shot) => !shot.active);
-  if (glob === undefined) return;
-  const dx = BEACON.x - enemy.x;
-  const dy = BEACON.y - enemy.y;
-  const distance = Math.hypot(dx, dy) || 1;
-  const speed = 155;
-  glob.active = true;
-  glob.x = enemy.x;
-  glob.y = enemy.y;
-  glob.vx = (dx / distance) * speed;
-  glob.vy = (dy / distance) * speed;
-  glob.radius = 7;
-  glob.damage = 3;
-  glob.life = 6;
-  state.particles.mote(enemy.x, enemy.y, '#fb923c', 5, 0.4, 20);
+/** A glob of gloom, arcing toward a target: the spitter's shot. */
+export function fireGlob(state, x, y, targetX, targetY, speed, damage) {
+  for (const shot of state.enemyShots) {
+    if (shot.active) continue;
+    const dx = targetX - x;
+    const dy = targetY - y;
+    const distance = Math.hypot(dx, dy) || 1;
+    shot.active = true;
+    shot.x = x;
+    shot.y = y;
+    shot.vx = (dx / distance) * speed;
+    shot.vy = (dy / distance) * speed;
+    shot.radius = 7;
+    shot.damage = damage;
+    shot.life = 6;
+    return;
+  }
 }
 
-/** Push overlapping creatures apart, so the swarm reads as individuals. */
-function separateEnemies(pool) {
-  for (let first = 0; first < pool.length; first += 1) {
-    const a = pool[first];
-    if (!a.active) continue;
-    for (let second = first + 1; second < pool.length; second += 1) {
-      const b = pool[second];
-      if (!b.active) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const minDistance = a.radius + b.radius;
-      const distanceSquared = dx * dx + dy * dy;
-      if (distanceSquared >= minDistance * minDistance || distanceSquared === 0) continue;
-      const distance = Math.sqrt(distanceSquared);
-      const push = (minDistance - distance) * 0.5;
-      const nx = dx / distance;
-      const ny = dy / distance;
-      a.x -= nx * push;
-      a.y -= ny * push;
-      b.x += nx * push;
-      b.y += ny * push;
+/** Move enemy shots; the world tests their collisions. */
+export function updateEnemyShots(state, dt) {
+  for (const shot of state.enemyShots) {
+    if (!shot.active) continue;
+    shot.life -= dt;
+    shot.x += shot.vx * dt;
+    shot.y += shot.vy * dt;
+    if (shot.life <= 0 || shot.x < -20 || shot.x > FIELD.width + 20 || shot.y < -20 || shot.y > FIELD.height + 20) {
+      shot.active = false;
     }
   }
 }
