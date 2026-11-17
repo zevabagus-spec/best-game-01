@@ -1,37 +1,50 @@
-import { createServer } from "node:http";
-import { readFileSync, statSync } from "node:fs";
-import { extname, join } from "node:path";
+// A tiny static server for local play: serves this directory's game/ folder
+// at http://localhost:8080. Node 22+, standard library only. Run it with
+// `node serve.ts`, then open the address in a desktop browser.
 
-const ROOT = new URL("game/", import.meta.url).pathname;
-const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
+import { createServer } from 'node:http';
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = fileURLToPath(new URL('.', import.meta.url));
+const root = join(here, 'game');
+const port = Number(process.env.PORT ?? 8080);
+
+const TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
-const portArg = process.argv.find((arg) => arg.startsWith("--port="))?.split("=")[1]
-  ?? process.argv[process.argv.indexOf("--port") + 1];
-const port = Number(portArg ?? 8080);
-
-createServer((req, res) => {
-  const path = decodeURIComponent(new URL(req.url ?? "/", "http://localhost").pathname);
-  const file = join(ROOT, path === "/" ? "index.html" : path);
-  if (!file.startsWith(ROOT)) {
-    res.writeHead(403);
-    res.end("forbidden");
+const server = createServer((request, response) => {
+  const url = new URL(request.url ?? '/', `http://localhost:${port}`);
+  let path = normalize(join(root, url.pathname));
+  if (!path.startsWith(root)) {
+    response.writeHead(403);
+    response.end('Forbidden');
     return;
   }
-  try {
-    if (!statSync(file).isFile()) throw new Error("not a file");
-    res.writeHead(200, {
-      "content-type": MIME[extname(file)] ?? "application/octet-stream",
-      "cache-control": "no-store",
-    });
-    res.end(readFileSync(file));
-  } catch {
-    res.writeHead(404);
-    res.end("not found");
+  if (existsSync(path) && statSync(path).isDirectory()) path = join(path, 'index.html');
+  if (!existsSync(path) || !statSync(path).isFile()) {
+    response.writeHead(404);
+    response.end('Not found');
+    return;
   }
-}).listen(port, "127.0.0.1", () => {
-  console.log(`Gloamtide at http://127.0.0.1:${port}/`);
+  response.writeHead(200, {
+    'content-type': TYPES[extname(path)] ?? 'application/octet-stream',
+    'cache-control': 'no-store',
+  });
+  createReadStream(path).pipe(response);
+});
+
+server.listen(port, () => {
+  console.log(`Sunspire is served at http://localhost:${port}`);
 });
