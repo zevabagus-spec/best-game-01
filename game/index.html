@@ -1,19 +1,20 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="icon" href="data:," />
-<title>Gloamtide — Keeper of the Drowned Light</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sunspire — Warden of the Dawn</title>
 <style>
-  html, body { margin: 0; padding: 0; background: #020a12; overflow: hidden; height: 100%; }
-  canvas { display: block; cursor: crosshair; }
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  html, body { margin: 0; padding: 0; background: #120e08; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { width: min(100vw, 177.78vh); height: min(100vh, 56.25vw); background: #ffe9b8; display: block; }
+  /* The status line is for screen readers; it never takes layout space. */
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Gloamtide: defend the drowned lighthouse beacon through twelve tides"></canvas>
-<p id="status" aria-live="polite">Gloamtide. Press Space or click to dive in.</p>
+<canvas id="game" width="1280" height="720" aria-label="Sunspire, a game of guarding the Sunspire against the gloom"></canvas>
+<p id="status" role="status" aria-live="polite">Sunspire. Press Space or click to begin.</p>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
