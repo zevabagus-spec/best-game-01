@@ -1,20 +1,19 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:,">
-<title>Emberfall — Keep the Last Lantern Lit</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>Gloamtide — Keeper of the Drowned Light</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0d24; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
-  /* Read aloud, never shown: the status line screen readers announce. */
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  html, body { margin: 0; padding: 0; background: #020a12; overflow: hidden; height: 100%; }
+  canvas { display: block; cursor: crosshair; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Emberfall: defend the last lantern. Move with WASD or the arrow keys, aim with the mouse, hold click to throw embers"></canvas>
-<p id="status" role="status" aria-live="polite"></p>
+<canvas id="game" aria-label="Gloamtide: defend the drowned lighthouse beacon through twelve tides"></canvas>
+<p id="status" aria-live="polite">Gloamtide. Press Space or click to dive in.</p>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
